@@ -192,12 +192,21 @@ err:
 }
 
 bool server_listen(void) {
+	int ret;
+
 	if (!s_server_started) {
 		return false;
 	}
 
 	while (s_server_started) {
-		sb_poll_server(s_server);
+		/* A failure here is a connection that was accepted and then dropped,
+		   because there was no memory or no room for another thread. Keep
+		   serving -- the condition may be transient -- but do not let a server
+		   that is turning clients away look healthy. */
+		ret = sb_poll_server(s_server);
+		if (ret != SB_RES_OK) {
+			EPRINTF("sb_poll_server failed: %s\n", sb_error_str(ret));
+		}
 
 		/* The listening socket is non-blocking, so sb_poll_server returns the
 		   moment nothing is waiting to be accepted. Without a pause here the

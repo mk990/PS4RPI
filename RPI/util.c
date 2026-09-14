@@ -166,7 +166,7 @@ bool read_file(const char* path, void** data, uint64_t* size, uint64_t max_size,
 	status = true;
 
 err:
-	if (fd > 0)
+	if (fd >= 0)
 		close(fd);
 
 	if (nread)
@@ -265,17 +265,21 @@ bool write_file(const char* path, const void* data, uint64_t size, uint64_t* nwr
 		for (size_left = size; size_left > 0;) {
 			n = write(fd, buf, (size_t)size_left);
 			if (n <= 0)
-				break; /* status is okay but we need to check num written parameter */
+				break;
 			size_left -= n;
 			total += n;
 			buf += n;
 		}
 	}
 
-	status = true;
+	/* A file that is not all there is not written. Every caller passes NULL for
+	   nwritten, so reporting success on a short write hands back a truncated
+	   param.sfo or a half-saved config and defers the failure to whoever reads
+	   it back. */
+	status = (total == size);
 
 err:
-	if (fd > 0)
+	if (fd >= 0)
 		close(fd);
 
 	if (nwritten)

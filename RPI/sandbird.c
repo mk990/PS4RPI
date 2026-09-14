@@ -972,7 +972,7 @@ fail:
 
 
 int sb_poll_server(sb_Server *srv) {
-  struct sb_Stream *st;
+  struct sb_Stream *st = NULL;
   sb_Socket sockfd = INVALID_SOCKET;
   pthread_t thr;
   int err;
@@ -992,9 +992,14 @@ int sb_poll_server(sb_Server *srv) {
     /* Link stream to list */
     sb_stream_link(st);
 
-    /* Create processing thread */
+    /* Create processing thread. It is detached because nothing ever joins it:
+       a joinable thread that has exited still holds its stack and control
+       block, so every request would leak one for the lifetime of the process.
+       A long install polls for progress thousands of times, and that leak is
+       what eventually makes pthread_create fail and drops the connection. */
     err = pthread_create(&thr, NULL, &conn_thread, st);
     if (err) goto fail;
+    pthread_detach(thr);
 
     sockfd = INVALID_SOCKET;
   }
@@ -1005,6 +1010,11 @@ fail:
   if (st) {
     /* Unlinking stream from list */
     sb_stream_unlink(st);
+
+    /* The stream owns the socket and its buffers, so destroying it releases
+       both; leaving it linked-out but alive leaked everything but the fd. */
+    sb_stream_destroy(st);
+    sockfd = INVALID_SOCKET;
   }
 
   if (sockfd != INVALID_SOCKET) {

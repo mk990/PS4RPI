@@ -124,7 +124,7 @@ err:
 		free(data);
 	}
 
-	if (fd > 0) {
+	if (fd >= 0) {
 		close(fd);
 	}
 
