@@ -8,7 +8,7 @@ set PKG_TITLE_ID="KPBR01111"
 set PKG_CONTENT_ID="IV0000-KPBR01111_00-AAAAAAAAAAAAAAAA"
 
 Rem Libraries to link in
-set libraries=-lc -lkernel -lc++ -lSceUserService -lSceSystemService -lSceNet -lSceHttp -lSceBgft -lSceAppInstUtil -lSceSsl -lSceSysmodule -lSceNetCtl -lSceJson -lSceNpUtility -lSceNpCommon
+set libraries=-lc -lkernel -lc++ -lSceUserService -lSceSystemService -lSceNet -lSceHttp -lSceBgft -lSceAppInstUtil -lSceSsl -lSceSysmodule -lSceNetCtl -lSceNpUtility -lSceNpCommon
 
 Rem set extra_flags=
 
