@@ -8,7 +8,16 @@ CONTENT_ID  := IV0000-KPBR01111_00-AAAAAAAAAAAAAAAA
 LIBS        := -lc -lkernel -lc++ -lSceUserService -lSceSystemService -lSceNet -lSceHttp -lSceBgft -lSceAppInstUtil -lSceSsl -lSceSysmodule -lSceNetCtl -lSceJson -lSceNpUtility -lSceNpCommon
 
 # Additional compile flags.
-#EXTRAFLAGS  := 
+#EXTRAFLAGS  :=
+
+# Warnings. The vendored single-header libraries (uthash, utlist, tiny-json,
+# sandbird) and the hand-written SDK import stubs are not warning-clean, so the
+# noisiest checks they trip are switched off rather than the whole set.
+WARNFLAGS   := -Wall -Wextra \
+               -Wno-unused-parameter \
+               -Wno-sign-compare \
+               -Wno-missing-field-initializers \
+               -Wno-deprecated-non-prototype
 
 # Asset and module directories.
 ASSETS 		:= $(wildcard assets/**/*)
@@ -29,7 +38,7 @@ CPPFILES    := $(wildcard $(PROJDIR)/*.cpp)
 OBJS        := $(patsubst $(PROJDIR)/%.c, $(INTDIR)/%.o, $(CFILES)) $(patsubst $(PROJDIR)/%.cpp, $(INTDIR)/%.o, $(CPPFILES))
 
 # Define final C/C++ flags
-CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include
+CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables $(WARNFLAGS) $(EXTRAFLAGS) -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include
 CXXFLAGS    := $(CFLAGS) -isystem $(TOOLCHAIN)/include/c++/v1
 LDFLAGS     := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr -L$(TOOLCHAIN)/lib $(LIBS) $(TOOLCHAIN)/lib/crt1.o
 
@@ -78,11 +87,27 @@ eboot.bin: $(INTDIR) $(OBJS)
 	$(TOOLCHAIN)/bin/$(CDIR)/create-fself -in=$(INTDIR)/$(PROJDIR).elf -out=$(INTDIR)/$(PROJDIR).oelf --eboot "eboot.bin" --paid 0x3800000000000011
 
 $(INTDIR)/%.o: $(PROJDIR)/%.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(INTDIR)/%.o: $(PROJDIR)/%.cpp
-	$(CCX) $(CXXFLAGS) -o $@ $<
+	$(CCX) $(CXXFLAGS) -c -o $@ $<
+
+# Compilation database for clangd / editor tooling. Reuses the same flags the
+# real build uses, so the editor sees exactly what the compiler sees.
+compile_commands.json:
+	@printf '[\n' > $@
+	@first=1; for f in $(CFILES); do \
+		if [ $$first -eq 0 ]; then printf ',\n' >> $@; fi; first=0; \
+		printf '  { "directory": "%s", "file": "%s", "command": "%s %s -c -o %s/%s.o %s" }' \
+			"$(CURDIR)" "$$f" "$(CC)" "$(CFLAGS)" "$(INTDIR)" "$$(basename $$f .c)" "$$f" >> $@; \
+	done
+	@printf '\n]\n' >> $@
+	@echo "wrote $@"
+
+.PHONY: all clean compile_commands
+
+compile_commands: compile_commands.json
 
 clean:
-	rm -f $(CONTENT_ID).pkg pkg.gp4 pkg/sce_sys/param.sfo eboot.bin \
+	rm -f $(CONTENT_ID).pkg pkg.gp4 pkg/sce_sys/param.sfo eboot.bin compile_commands.json \
 		$(INTDIR)/$(PROJDIR).elf $(INTDIR)/$(PROJDIR).oelf $(OBJS)

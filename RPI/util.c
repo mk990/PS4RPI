@@ -4,6 +4,40 @@
 #include <ctype.h>
 
 #include <fcntl.h>
+static char to_hex(unsigned char code) {
+	static const char hex[] = "0123456789abcdef";
+	return hex[code & 15];
+}
+
+char* url_encode(const char* src) {
+	const unsigned char* in;
+	char* buf;
+	char* out;
+
+	assert(src != NULL);
+
+	/* Worst case every byte becomes "%XX". */
+	buf = (char*)malloc(strlen(src) * 3 + 1);
+	if (!buf) {
+		EPRINTF("malloc failed\n");
+		return NULL;
+	}
+
+	for (in = (const unsigned char*)src, out = buf; *in; ++in) {
+		if (isalnum(*in) || *in == '-' || *in == '_' || *in == '.' || *in == '~' ||
+		    *in == '+' || *in == ':' || *in == '/' || *in == '@') {
+			*out++ = (char)*in;
+		} else {
+			*out++ = '%';
+			*out++ = to_hex(*in >> 4);
+			*out++ = to_hex(*in & 15);
+		}
+	}
+	*out = '\0';
+
+	return buf;
+}
+
 bool get_language_id(int* lang_id) {
 	int value;
 	int ret;
@@ -149,6 +183,65 @@ err:
 				free(buf);
 		}
 	}
+
+	return status;
+}
+
+bool read_text_file(const char* path, char** data, size_t* size, size_t max_size) {
+	struct stat info;
+	char* buf = NULL;
+	char* p;
+	size_t file_size, total = 0;
+	ssize_t n;
+	bool status = false;
+	int fd = -1;
+
+	assert(path != NULL);
+	assert(data != NULL);
+
+	*data = NULL;
+	if (size) {
+		*size = 0;
+	}
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		goto err;
+
+	if (fstat(fd, &info) < 0)
+		goto err;
+	file_size = (size_t)info.st_size;
+
+	if (max_size > 0 && file_size > max_size)
+		goto err;
+
+	buf = (char*)malloc(file_size + 1);
+	if (!buf)
+		goto err;
+
+	for (p = buf; total < file_size;) {
+		n = read(fd, p, file_size - total);
+		if (n <= 0)
+			break;
+		total += n;
+		p += n;
+	}
+	buf[total] = '\0';
+
+	*data = buf;
+	buf = NULL;
+	if (size) {
+		*size = total;
+	}
+
+	status = true;
+
+err:
+	if (fd >= 0)
+		close(fd);
+
+	if (buf)
+		free(buf);
 
 	return status;
 }

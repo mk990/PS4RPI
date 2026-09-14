@@ -189,7 +189,7 @@ int sceHttpsSetSslCallback(int id, OrbisHttpsCallback cbfunc, void *userArg);
 // Empty Comment
 void sceHttpsSetSslVersion();
 // Empty Comment
-void sceHttpsUnloadCert();
+int sceHttpsUnloadCert(int httpCtxId);
 // Empty Comment
 int sceHttpTerm(int httpCtxId);
 // Empty Comment
@@ -203,7 +203,7 @@ void sceHttpUriBuild();
 // Empty Comment
 void sceHttpUriCopy();
 // TODO: pr
-int sceHttpUriEscape();
+int sceHttpUriEscape(char* out, size_t* require, size_t prepare, const char* in);
 // Empty Comment
 void sceHttpUriMerge();
 // Empty Comment
@@ -211,7 +211,7 @@ void sceHttpUriParse();
 // Empty Comment
 void sceHttpUriSweepPath();
 // TODO: pr
-int sceHttpUriUnescape();
+int sceHttpUriUnescape(char* out, size_t* require, size_t prepare, const char* in);
 // Empty Comment
 void sceHttpWaitRequest();
 
@@ -230,13 +230,47 @@ typedef enum SceHttpsFlag {
 	SCE_HTTPS_FLAG_KNOWN_CA_CHECK       = (0x20U)
 } SceHttpsFlag;
 
+/* Where the persisted settings and the user-supplied CA bundle live by default.
+   Both sit next to the temporary package files in the working directory. */
+#define HTTP_CONFIG_PATH "/data/rpi_config.json"
+#define HTTP_CA_BUNDLE_PATH "/data/rpi_cacert.pem"
+
+/* TLS verification policy applied to remote package servers. */
+enum http_ssl_verify_mode {
+	HTTP_SSL_VERIFY_DEFAULT = -1, /* whatever the persisted setting says */
+	HTTP_SSL_VERIFY_OFF = 0,      /* accept any certificate (legacy behaviour) */
+	HTTP_SSL_VERIFY_ON = 1,       /* verify chain, host name and validity period */
+};
+
 bool http_init(void);
 void http_fini(void);
 
-bool http_get_file_size(const char* url, uint64_t* total_size);
-bool http_download_file(const char* url, uint8_t** data, uint64_t* data_size, uint64_t* total_size, uint64_t offset);
+/* ssl_verify is one of enum http_ssl_verify_mode. It is passed explicitly
+   because requests are served on per-connection threads, so a caller cannot
+   safely flip a global around one transfer. */
+bool http_get_file_size(const char* url, uint64_t* total_size, int ssl_verify);
+bool http_download_file(const char* url, uint8_t** data, uint64_t* data_size, uint64_t* total_size, uint64_t offset, int ssl_verify);
 
-bool http_escape_uri(char** out, size_t* out_size, const char* in);
 bool http_unescape_uri(char** out, size_t* out_size, const char* in);
 
 bool http_escape_json_string(char* out, size_t max_out_size, const char* in);
+
+/* The default verification mode, used when a request asks for
+   HTTP_SSL_VERIFY_DEFAULT. */
+int http_get_ssl_verify(void);
+void http_set_ssl_verify(int mode);
+
+/* Extra trusted roots for the console's outdated CA store, as a concatenated
+   PEM bundle. Reloading replaces whatever was loaded before. */
+bool http_load_ca_bundle(const char* path);
+bool http_has_ca_bundle(void);
+const char* http_get_ca_bundle_path(void);
+
+/* Settings persisted across launches (verify mode and CA bundle path). */
+bool http_load_config(const char* path);
+bool http_save_config(const char* path);
+
+/* Human-readable description of the last transport failure, "" if none.
+   Best-effort only: concurrent requests share this buffer. */
+const char* http_get_last_error(void);
+void http_clear_last_error(void);

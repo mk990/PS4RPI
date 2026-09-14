@@ -74,7 +74,7 @@ err:
 	return status;
 }
 
-char** pkg_extract_piece_urls_from_ref_pkg_json(const char* url, size_t* piece_count) {
+char** pkg_extract_piece_urls_from_ref_pkg_json(const char* url, size_t* piece_count, int ssl_verify) {
 	static json_t* pool = NULL;
 	const size_t pool_size = 256;
 	const json_t* root;
@@ -96,8 +96,8 @@ char** pkg_extract_piece_urls_from_ref_pkg_json(const char* url, size_t* piece_c
 	}
 
 	//printf("Downloading reference package json: %s\n", url);
-	if (!http_download_file(url, (uint8_t**)&data, &size, &total_size, 0)) {
-		EPRINTF("Unable to download reference package json '%s'.\n", url);
+	if (!http_download_file(url, (uint8_t**)&data, &size, &total_size, 0, ssl_verify)) {
+		EPRINTF("Unable to download reference package json '%s': %s\n", url, http_get_last_error());
 		goto err;
 	}
 	//printf("Reference package json total size: 0x%" PRIX64 "\n", total_size);
@@ -179,8 +179,15 @@ char** pkg_extract_piece_urls_from_ref_pkg_json(const char* url, size_t* piece_c
 			goto err;
 		}
 
-		piece_urls[i++] = unescaped_url;
+		/* Re-encode so hosts serving paths with spaces or non-ASCII characters
+		   work here exactly as they do for a direct install. */
+		piece_urls[i] = url_encode(unescaped_url);
+		free(unescaped_url);
 		unescaped_url = NULL;
+		if (!piece_urls[i]) {
+			goto err;
+		}
+		++i;
 	}
 
 	if (piece_count) {
@@ -227,7 +234,7 @@ err:
 		EPRINTF(format, ##__VA_ARGS__); \
 	} while (0)
 
-bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* ref_pkg_json_path, const char* param_sfo_path, const char* icon0_png_path, enum pkg_content_type* content_type, uint64_t* package_size, bool* is_patch, bool* has_icon, char* error_buf, size_t error_buf_size) {
+bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* ref_pkg_json_path, const char* param_sfo_path, const char* icon0_png_path, enum pkg_content_type* content_type, uint64_t* package_size, bool* is_patch, bool* has_icon, char* error_buf, size_t error_buf_size, int ssl_verify) {
 	static const uint8_t magic[] = { '\x7F', 'C', 'N', 'T' };
 	struct pkg_header* hdr;
 	struct pkg_table_entry* entries;
@@ -248,10 +255,6 @@ bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* 
 	size_t entry_count;
 	char pkg_digest_str[PKG_DIGEST_SIZE * 2 + 1];
 	char piece_digest_str[PKG_MINI_DIGEST_SIZE * 2 + 1];
-#ifdef ESCAPE_URL
-	char* escaped_url = NULL;
-	size_t escaped_url_size;
-#endif
 	FILE* fp = NULL;
 	size_t i;
 	bool status = false;
@@ -282,8 +285,14 @@ bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* 
 	unlink(icon0_png_path);
 
 	//printf("Downloading package header: %s\n", piece_urls[0]);
-	if (!http_download_file(piece_urls[0], &hdr_data, &hdr_size, &total_size, 0)) {
-		PKG_THROW_ERROR("Unable to download package header for '%s'.\n", piece_urls[0]);
+	if (!http_download_file(piece_urls[0], &hdr_data, &hdr_size, &total_size, 0, ssl_verify)) {
+		/* This is the first transfer, so it is where a TLS problem surfaces.
+		   Pass the transport's own message through instead of a generic one. */
+		if (*http_get_last_error() != '\0') {
+			PKG_THROW_ERROR("%s", http_get_last_error());
+		} else {
+			PKG_THROW_ERROR("Unable to download package header for '%s'.\n", piece_urls[0]);
+		}
 		goto err;
 	}
 	//printf("Package header size: 0x%" PRIX64 "\n", hdr_size);
@@ -318,7 +327,7 @@ bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* 
 	}
 
 	//printf("Downloading package entry table: %s\n", piece_urls[0]);
-	if (!http_download_file(piece_urls[0], &entry_table_data, &entry_table_size, NULL, entry_table_offset)) {
+	if (!http_download_file(piece_urls[0], &entry_table_data, &entry_table_size, NULL, entry_table_offset, ssl_verify)) {
 		PKG_THROW_ERROR("Unable to download package entry table for '%s'.\n", piece_urls[0]);
 		goto err;
 	}
@@ -348,7 +357,7 @@ next:;
 	if (param_sfo_offset > 0 && param_sfo_size > 0) {
 		//printf("Downloading %s: %s\n", "param.sfo", piece_urls[0]);
 		param_sfo_dl_size = param_sfo_size;
-		if (!http_download_file(piece_urls[0], &param_sfo_data, &param_sfo_dl_size, NULL, param_sfo_offset)) {
+		if (!http_download_file(piece_urls[0], &param_sfo_data, &param_sfo_dl_size, NULL, param_sfo_offset, ssl_verify)) {
 			PKG_THROW_ERROR("Unable to download %s for '%s'.\n", "param.sfo", piece_urls[0]);
 			goto err;
 		}
@@ -362,7 +371,7 @@ next:;
 	if (icon0_png_offset > 0 && icon0_png_size > 0) {
 		//printf("Downloading %s: %s\n", "icon0.png", piece_urls[0]);
 		icon0_png_dl_size = icon0_png_size;
-		if (!http_download_file(piece_urls[0], &icon0_png_data, &icon0_png_dl_size, NULL, icon0_png_offset)) {
+		if (!http_download_file(piece_urls[0], &icon0_png_data, &icon0_png_dl_size, NULL, icon0_png_offset, ssl_verify)) {
 			PKG_THROW_ERROR("Unable to download %s for '%s'.\n", "icon0.png", piece_urls[0]);
 			goto err;
 		}
@@ -396,38 +405,22 @@ next:;
 	for (i = 0, offset = 0; i < piece_count; ++i) {
 		if (i > 0) {
 			//printf("Getting piece information: %s\n", piece_urls[i]);
-			if (!http_get_file_size(piece_urls[i], &total_size)) {
+			if (!http_get_file_size(piece_urls[i], &total_size, ssl_verify)) {
 				PKG_THROW_ERROR("Unable to get file size for piece '%s'.\n", piece_urls[i]);
 				goto err_file_close;
 			}
 			//printf("Piece size: 0x%" PRIX64 "\n", total_size);
 		}
 
-#ifdef ESCAPE_URL
-		if (!http_escape_uri(&escaped_url, &escaped_url_size, piece_urls[i])) {
-			PKG_THROW_ERROR("Unable to escape URL for piece '%s'.\n", piece_urls[i]);
-			goto err_file_close;
-		}
-#endif
-
 		fprintf(fp,
 			"{\"url\":\"%s\",\"fileOffset\":%" PRIu64 ",\"fileSize\":%" PRIu64 ",\"hashValue\":\"%s\"}",
-#ifdef ESCAPE_URL
-			escaped_url, offset, total_size, piece_digest_str
-#else
 			piece_urls[i], offset, total_size, piece_digest_str
-#endif
 		);
 		if (i + 1 < piece_count) {
 			fputs(",", fp);
 		}
 
 		offset += total_size;
-
-#ifdef ESCAPE_URL
-		free(escaped_url);
-		escaped_url = NULL;
-#endif
 	}
 
 	fputs("]}", fp);
@@ -471,7 +464,6 @@ err_file_close:
 		fclose(fp);
 	}
 
-err_file_unlink:
 	if (!status) {
 		unlink(icon0_png_path);
 		unlink(param_sfo_path);
@@ -479,12 +471,6 @@ err_file_unlink:
 	}
 
 err:
-#ifdef ESCAPE_URL
-	if (escaped_url) {
-		free(escaped_url);
-	}
-#endif
-
 	if (icon0_png_data) {
 		free(icon0_png_data);
 	}

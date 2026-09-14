@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  syntax:
+    name: Syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Parse sources with -Wall -Wextra
+        run: ./ci/syntax-check.sh
+
+  build:
+    name: Package build
+    runs-on: ubuntu-latest
+    # The toolchain is fetched from a third-party release, so a change in its
+    # asset layout should report rather than block. Once this is pinned to a
+    # known-good release, drop this line to make the build gating.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang and lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld unzip
+
+      - name: Fetch OpenOrbis toolchain
+        run: |
+          set -eu
+          api=https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest
+          url=$(curl -fsSL "$api" | jq -r '[.assets[] | select(.name | test("\\.(zip|tar\\.gz)$"))][0].browser_download_url // empty')
+          if [ -z "$url" ]; then
+            echo "No toolchain archive on the latest release; pin a known-good asset here." >&2
+            exit 1
+          fi
+          echo "Downloading $url"
+          mkdir -p "$HOME/toolchain"
+          case "$url" in
+            *.zip)    curl -fsSL "$url" -o /tmp/oo.zip && unzip -q /tmp/oo.zip -d "$HOME/toolchain" ;;
+            *.tar.gz) curl -fsSL "$url" | tar -xz -C "$HOME/toolchain" ;;
+          esac
+          root="$HOME/toolchain"
+          if [ ! -d "$root/include" ]; then
+            inner=$(find "$root" -maxdepth 3 -type d -name include -print -quit)
+            if [ -n "$inner" ]; then root=$(dirname "$inner"); fi
+          fi
+          chmod -R +x "$root/bin" 2>/dev/null || true
+          echo "OO_PS4_TOOLCHAIN=$root" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi-pkg
+          path: '*.pkg'
+          if-no-files-found: warn

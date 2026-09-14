@@ -64,8 +64,8 @@ struct pkg_content_info {
 
 bool pkg_parse_content_id(const char* content_id, struct pkg_content_info* info);
 
-char** pkg_extract_piece_urls_from_ref_pkg_json(const char* url, size_t* piece_count);
+char** pkg_extract_piece_urls_from_ref_pkg_json(const char* url, size_t* piece_count, int ssl_verify);
 
-bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* ref_pkg_json_path, const char* param_sfo_path, const char* icon0_png_path, enum pkg_content_type* content_type, uint64_t* package_size, bool* is_patch, bool* has_icon, char* error_buf, size_t error_buf_size);
+bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* ref_pkg_json_path, const char* param_sfo_path, const char* icon0_png_path, enum pkg_content_type* content_type, uint64_t* package_size, bool* is_patch, bool* has_icon, char* error_buf, size_t error_buf_size, int ssl_verify);
 
 bool pkg_is_patch(struct pkg_header* hdr);

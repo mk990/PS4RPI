@@ -7,6 +7,8 @@ bool get_language_id(int* lang_id);
 int bytes_to_hex(char* buf, size_t buf_size, const void* data, size_t data_size);
 
 bool read_file(const char* path, void** data, uint64_t* size, uint64_t max_size, uint64_t* nread);
+/* Reads a whole file into a NUL-terminated buffer that the caller must free. */
+bool read_text_file(const char* path, char** data, size_t* size, size_t max_size);
 bool write_file(const char* path, const void* data, uint64_t size, uint64_t* nwritten, int mode, unsigned int flags);
 bool write_file_trunc(const char* path, const void* data, uint64_t size, uint64_t* nwritten, int mode);
 
@@ -16,11 +18,14 @@ void hexdump(const void* data, size_t size);
 
 bool starts_with(const char* haystack, const char* needle);
 bool ends_with(const char* haystack, const char* needle);
-
-bool ends_with(const char* haystack, const char* needle);
 bool ends_with_nocase(const char* haystack, const char* needle);
 
 char* rtrim(char* s);
+
+/* Percent-encodes everything that is not safe inside a URL path or query,
+   leaving the reserved characters that structure a URL alone. Returns a buffer
+   the caller must free, or NULL on allocation failure. */
+char* url_encode(const char* src);
 
 #define NSEC_PER_USEC INT64_C(1000)
 #define NSEC_PER_MSEC INT64_C(1000000)

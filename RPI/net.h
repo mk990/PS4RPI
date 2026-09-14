@@ -179,7 +179,7 @@ void sceNetEpollDestroy();
 // Empty Comment
 void sceNetEpollWait();
 // TODO: pr
-int sceNetErrnoLoc();
+int* sceNetErrnoLoc(void);
 // Empty Comment
 void sceNetEtherNtostr();
 // Empty Comment
@@ -261,7 +261,7 @@ uint16_t sceNetNtohs(uint16_t);
 // Empty Comment
 int sceNetPoolCreate(const char *name, int size, int flags);
 // TODO: pr
-int sceNetPoolDestroy();
+int sceNetPoolDestroy(int memId);
 // Empty Comment
 void sceNetPppoeStart();
 // Empty Comment
@@ -359,6 +359,3 @@ int net_get_mem_id(void);
 void net_fini(void);
 
 int net_get_ipv4(char* buf, size_t buf_size);
-
-int net_send_all(int sock_id, const void* data, size_t size, size_t* sent);
-int net_recv_all(int sock_id, void* data, size_t size, size_t* received);

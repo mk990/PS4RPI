@@ -16,11 +16,23 @@
 
 #define CLEANUP_DAY_COUNT 3
 
+/* Enough for the largest request any endpoint accepts. */
+#define JSON_POOL_SIZE 256
+
+/* Upper bound on a GET ?data= payload. */
+#define QUERY_DATA_SIZE 2048
+
+enum {
+	METHOD_GET = 1 << 0,
+	METHOD_POST = 1 << 1,
+};
+
 typedef bool handler_cb(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
 
 struct handler_desc {
 	const char* path;
 	handler_cb* handler;
+	unsigned int methods;
 	bool need_partial_match;
 };
 
@@ -30,11 +42,17 @@ union json_value_t {
 	int64_t ival;
 };
 
+/* Parsed request body. The pool lives in the caller's frame: handlers run on
+   per-connection threads, so nothing here may be static. */
+struct request {
+	sb_Stream* s;
+	json_t pool[JSON_POOL_SIZE];
+	const json_t* root;
+};
+
 #define THROW_ERROR(format, ...) \
 	do { \
-		char tmp_buf[256]; \
-		snprintf(tmp_buf, sizeof(tmp_buf), format, ##__VA_ARGS__); \
-		kick_error(s, 500, "Internal server error", tmp_buf); \
+		kick_errorf(s, 500, "Internal server error", format, ##__VA_ARGS__); \
 		goto err; \
 	} while (0)
 
@@ -48,61 +66,68 @@ static bool s_server_started = false;
 static int event_handler(sb_Event* e);
 
 static bool handle_api_install(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_uninstall_game(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_uninstall_ac(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_uninstall_patch(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_uninstall_theme(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
+static bool handle_api_uninstall(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
 static bool handle_api_is_exists(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_start_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_stop_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_pause_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_resume_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
-static bool handle_api_unregister_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
+static bool handle_api_task_action(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
 static bool handle_api_get_task_progress(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
 static bool handle_api_find_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
+static bool handle_api_settings(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
 
 static bool handle_static(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size);
 
 static void set_cors_header(sb_Stream* s);
 static void kick_error(sb_Stream* s, int code, const char* title, const char* error);
+static void kick_errorf(sb_Stream* s, int code, const char* title, const char* format, ...);
 static void kick_result_header_json(sb_Stream* s);
 static void kick_error_json(sb_Stream* s, int code);
-static void kick_success_json(sb_Stream* s);
 
 static void cleanup_temp_files(void);
 
-static char* encodeURI(char *src);
-
-static const struct handler_desc s_get_handlers[] = {
-	{ "/static/", &handle_static, true },
-	{ "/api/install", &handle_api_install, false },
-	{ "/api/uninstall_game", &handle_api_uninstall_game, false },
-	{ "/api/uninstall_ac", &handle_api_uninstall_ac, false },
-	{ "/api/uninstall_patch", &handle_api_uninstall_patch, false },
-	{ "/api/uninstall_theme", &handle_api_uninstall_theme, false },
-	{ "/api/is_exists", &handle_api_is_exists, false },
-	{ "/api/start_task", &handle_api_start_task, false },
-	{ "/api/stop_task", &handle_api_stop_task, false },
-	{ "/api/pause_task", &handle_api_pause_task, false },
-	{ "/api/resume_task", &handle_api_resume_task, false },
-	{ "/api/unregister_task", &handle_api_unregister_task, false },
-	{ "/api/get_task_progress", &handle_api_get_task_progress, false },
-	{ "/api/find_task", &handle_api_find_task, false },
+static const struct handler_desc s_handlers[] = {
+	{ "/static/",              &handle_static,                METHOD_GET,               true },
+	{ "/api/install",          &handle_api_install,           METHOD_GET | METHOD_POST, false },
+	{ "/api/uninstall_game",   &handle_api_uninstall,         METHOD_GET | METHOD_POST, false },
+	{ "/api/uninstall_ac",     &handle_api_uninstall,         METHOD_GET | METHOD_POST, false },
+	{ "/api/uninstall_patch",  &handle_api_uninstall,         METHOD_GET | METHOD_POST, false },
+	{ "/api/uninstall_theme",  &handle_api_uninstall,         METHOD_GET | METHOD_POST, false },
+	{ "/api/is_exists",        &handle_api_is_exists,         METHOD_GET | METHOD_POST, false },
+	{ "/api/start_task",       &handle_api_task_action,       METHOD_GET | METHOD_POST, false },
+	{ "/api/stop_task",        &handle_api_task_action,       METHOD_GET | METHOD_POST, false },
+	{ "/api/pause_task",       &handle_api_task_action,       METHOD_GET | METHOD_POST, false },
+	{ "/api/resume_task",      &handle_api_task_action,       METHOD_GET | METHOD_POST, false },
+	{ "/api/unregister_task",  &handle_api_task_action,       METHOD_GET | METHOD_POST, false },
+	{ "/api/get_task_progress",&handle_api_get_task_progress, METHOD_GET | METHOD_POST, false },
+	{ "/api/find_task",        &handle_api_find_task,         METHOD_GET | METHOD_POST, false },
+	{ "/api/settings",         &handle_api_settings,          METHOD_GET | METHOD_POST, false },
 };
-static const struct handler_desc s_post_handlers[] = {
-	{ "/api/install", &handle_api_install, false },
-	{ "/api/uninstall_game", &handle_api_uninstall_game, false },
-	{ "/api/uninstall_ac", &handle_api_uninstall_ac, false },
-	{ "/api/uninstall_patch", &handle_api_uninstall_patch, false },
-	{ "/api/uninstall_theme", &handle_api_uninstall_theme, false },
-	{ "/api/is_exists", &handle_api_is_exists, false },
-	{ "/api/start_task", &handle_api_start_task, false },
-	{ "/api/stop_task", &handle_api_stop_task, false },
-	{ "/api/pause_task", &handle_api_pause_task, false },
-	{ "/api/resume_task", &handle_api_resume_task, false },
-	{ "/api/unregister_task", &handle_api_unregister_task, false },
-	{ "/api/get_task_progress", &handle_api_get_task_progress, false },
-	{ "/api/find_task", &handle_api_find_task, false },
+
+/* The five task endpoints differ only by the BGFT call they make. */
+typedef bool bgft_task_fn(int task_id, int* error);
+
+static const struct {
+	const char* path;
+	bgft_task_fn* fn;
+} s_task_actions[] = {
+	{ "/api/start_task",      &bgft_download_start_task },
+	{ "/api/stop_task",       &bgft_download_stop_task },
+	{ "/api/pause_task",      &bgft_download_pause_task },
+	{ "/api/resume_task",     &bgft_download_resume_task },
+	{ "/api/unregister_task", &bgft_download_unregister_task },
+};
+
+/* Likewise the four uninstall endpoints, which differ by call and id field. */
+typedef bool uninstall_fn(const char* id, int* error);
+
+static const struct {
+	const char* path;
+	uninstall_fn* fn;
+	const char* field;
+	size_t id_size;
+} s_uninstall_actions[] = {
+	{ "/api/uninstall_game",  &app_inst_util_uninstall_game,  "title_id",   PKG_TITLE_ID_SIZE + 1 },
+	{ "/api/uninstall_ac",    &app_inst_util_uninstall_ac,    "content_id", PKG_CONTENT_ID_SIZE + 1 },
+	{ "/api/uninstall_patch", &app_inst_util_uninstall_patch, "title_id",   PKG_TITLE_ID_SIZE + 1 },
+	{ "/api/uninstall_theme", &app_inst_util_uninstall_theme, "content_id", PKG_CONTENT_ID_SIZE + 1 },
 };
 
 bool server_start(const char* ip_address, int port, const char* work_dir) {
@@ -164,17 +189,14 @@ err:
 
 bool server_listen(void) {
 	if (!s_server_started) {
-		goto err;
+		return false;
 	}
 
-	for (;;) {
+	while (s_server_started) {
 		sb_poll_server(s_server);
 	}
 
 	return true;
-
-err:
-	return false;
 }
 
 void server_stop(void) {
@@ -195,92 +217,129 @@ void server_stop(void) {
 	s_server_started = false;
 }
 
-char *sb_get_query_data(sb_Stream *st, const char *name) {
-  char *data;
-  size_t len = st->recv_buf.len;
+/*
+ * Request parsing.
+ *
+ * Every helper answers the client itself when it fails, so a handler only has
+ * to stop what it is doing.
+ */
 
-  data = (char *)malloc(sizeof(char) * 512);
-  sb_get_var(st, name, data, 512);
-  return data;
+static bool request_parse(struct request* req, sb_Stream* s, char* in_data) {
+	assert(req != NULL);
+	assert(s != NULL);
+
+	req->s = s;
+	memset(req->pool, 0, sizeof(req->pool));
+
+	if (!in_data || *in_data == '\0') {
+		kick_error(s, 400, "Bad request", "Missing request body");
+		return false;
+	}
+
+	req->root = json_create(in_data, req->pool, ARRAY_SIZE(req->pool));
+	if (!req->root) {
+		kick_error(s, 400, "Bad request", "Invalid JSON format");
+		return false;
+	}
+
+	return true;
 }
 
-char *sb_get_content_data(sb_Stream *st) {
-  return st->recv_buf.s + st->data_idx;
-}
-
-static int event_handler(sb_Event* e) {
-	const struct handler_desc* descs = NULL;
-	handler_cb* handler = NULL;
-	size_t count;
-	size_t i;
-	int ret;
-
-	sb_Stream *st = e->stream;
-	int type = e->type;
-	const char *path = e->path;
-	const char *method = e->method;
-
-	if (type != SB_EV_REQUEST) {
-		ret = SB_RES_OK;
-		goto done;
-	}
-	if (strcasecmp(method, "OPTIONS") == 0) {
-			kick_result_header_json(st);
-			ret = SB_RES_OK;
-			goto done;
-	} else if (strcasecmp(method, "GET") == 0) {
-		descs = s_get_handlers;
-		count = ARRAY_SIZE(s_get_handlers);
-	} else if (strcasecmp(method, "POST") == 0) {
-		descs = s_post_handlers;
-		count = ARRAY_SIZE(s_post_handlers);
-	}
-	if (!descs) {
-bad_request:
-		kick_error(st, 400, "Bad request", "Unsupported method");
-		ret = SB_RES_OK;
-		goto done;
-	}
-
-	for (i = 0; i < count; ++i) {
-		if (descs[i].need_partial_match) {
-			if (strstr(path, descs[i].path) == path) {
-				handler = descs[i].handler;
-				break;
-			}
-		} else {
-			if (strcmp(path, descs[i].path) == 0) {
-				handler = descs[i].handler;
-				break;
-			}
-		}
-	}
-	if (!handler) {
-		goto bad_request;
-	}
-
-  char *data = NULL;
-  if (strcmp(method, "POST") == 0) {
-    data = sb_get_content_data(st);
-  } else if (strcmp(method, "GET") == 0) {
-    data = sb_get_query_data(st, "data");
-  }
-
-	(*handler)(st, method, path, data, sizeof(data));
-
-	ret = SB_RES_OK;
-
-done:
-	return ret;
-}
-
-static inline bool handle_api_install_direct(sb_Stream* s, const json_t* root) {
+static const json_t* request_field(struct request* req, const char* name, jsonType_t type) {
 	const json_t* field;
-	union json_value_t val, child_val;
-	char** piece_urls = NULL;
-	char* unescaped_url = NULL;
-	size_t unescaped_url_size;
-	size_t piece_count;
+
+	field = json_getProperty(req->root, name);
+	if (!field) {
+		kick_errorf(req->s, 400, "Bad request", "No '%s' parameter specified.", name);
+		return NULL;
+	}
+	if (json_getType(field) != type) {
+		kick_errorf(req->s, 400, "Bad request", "Invalid type for parameter '%s'.", name);
+		return NULL;
+	}
+
+	return field;
+}
+
+static bool request_str(struct request* req, const char* name, const char** out) {
+	const json_t* field = request_field(req, name, JSON_TEXT);
+
+	if (!field) {
+		return false;
+	}
+
+	*out = json_getValue(field);
+
+	return true;
+}
+
+/* Copies a bounded identifier (title id, content id, ...) into a fixed buffer. */
+static bool request_id(struct request* req, const char* name, char* out, size_t out_size) {
+	const char* val;
+
+	if (!request_str(req, name, &val)) {
+		return false;
+	}
+	if (*val == '\0') {
+		kick_errorf(req->s, 400, "Bad request", "Empty value for parameter '%s'.", name);
+		return false;
+	}
+
+	strlcpy(out, val, out_size);
+
+	return true;
+}
+
+static bool request_int(struct request* req, const char* name, int* out) {
+	const json_t* field = request_field(req, name, JSON_INTEGER);
+
+	if (!field) {
+		return false;
+	}
+
+	*out = (int)json_getInteger(field);
+
+	return true;
+}
+
+static bool request_task_id(struct request* req, int* out) {
+	if (!request_int(req, "task_id", out)) {
+		return false;
+	}
+	if (*out < 0) {
+		kick_errorf(req->s, 400, "Bad request", "Invalid value for '%s' parameter specified.", "task_id");
+		return false;
+	}
+
+	return true;
+}
+
+/* Optional boolean: absent leaves *out untouched, present but wrongly typed is
+   an error. */
+static bool request_bool_opt(struct request* req, const char* name, bool* out) {
+	const json_t* field;
+
+	field = json_getProperty(req->root, name);
+	if (!field) {
+		return true;
+	}
+	if (json_getType(field) != JSON_BOOLEAN) {
+		kick_errorf(req->s, 400, "Bad request", "Invalid type for parameter '%s'.", name);
+		return false;
+	}
+
+	*out = json_getBoolean(field);
+
+	return true;
+}
+
+/*
+ * Install.
+ */
+
+/* Shared tail of both install flavours: inspect the package, publish the
+   reference JSON and hand a download task to BGFT. The caller owns piece_urls. */
+static bool install_pieces(sb_Stream* s, char** piece_urls, size_t piece_count, int ssl_verify) {
 	char tmp_name[32];
 	char ref_pkg_json_path[1024];
 	char param_sfo_path[1024];
@@ -293,17 +352,19 @@ static inline bool handle_api_install_direct(sb_Stream* s, const json_t* root) {
 	char content_id[PKG_CONTENT_ID_SIZE + 1];
 	char content_url[256];
 	char icon_path[1024];
+	char error_buf[256];
 	enum pkg_content_type content_type;
 	const char* package_type;
 	const char* package_sub_type = NULL;
-	char error_buf[256];
 	uint64_t package_size;
 	bool is_patch;
 	bool has_icon = false;
 	int lang_id;
 	int task_id = -1;
-	size_t i;
 	int ret;
+
+	assert(piece_urls != NULL);
+	assert(piece_count > 0);
 
 	memset(ref_pkg_json_path, 0, sizeof(ref_pkg_json_path));
 	memset(param_sfo_path, 0, sizeof(param_sfo_path));
@@ -313,13 +374,132 @@ static inline bool handle_api_install_direct(sb_Stream* s, const json_t* root) {
 		THROW_ERROR("Unable to get language id.");
 	}
 
-	field = json_getProperty(root, "packages");
+	snprintf(tmp_name, sizeof(tmp_name), "tmp_%" PRIxMAX, (uintmax_t)(s->init_time) ^ (uint32_t)(uintptr_t)s);
+
+	snprintf(ref_pkg_json_path, sizeof(ref_pkg_json_path), "%s/%s.json", s_work_dir, tmp_name);
+	snprintf(param_sfo_path, sizeof(param_sfo_path), "%s/%s.sfo", s_work_dir, tmp_name);
+	snprintf(icon0_png_path, sizeof(icon0_png_path), "%s/%s.png", s_work_dir, tmp_name);
+
+	memset(error_buf, 0, sizeof(error_buf));
+	if (!pkg_setup_prerequisites(piece_urls, piece_count, ref_pkg_json_path, param_sfo_path, icon0_png_path, &content_type, &package_size, &is_patch, &has_icon, error_buf, sizeof(error_buf), ssl_verify)) {
+		rtrim(error_buf);
+		if (*error_buf != '\0')
+			THROW_ERROR("Unable to set up prerequisites for package '%s': %s", piece_urls[0], error_buf);
+		else
+			THROW_ERROR("Unable to set up prerequisites for package '%s'.", piece_urls[0]);
+	}
+
+	switch (content_type) {
+		case PKG_CONTENT_TYPE_GD: package_type = "PS4GD"; break;
+		case PKG_CONTENT_TYPE_AC: package_type = "PS4AC"; break;
+		case PKG_CONTENT_TYPE_AL: package_type = "PS4AL"; break;
+		case PKG_CONTENT_TYPE_DP: package_type = "PS4DP"; break;
+		default:
+			package_type = NULL;
+			THROW_ERROR("Unsupported content type for package '%s'.", piece_urls[0]);
+			break;
+	}
+
+	sfo = sfo_alloc();
+	if (!sfo) {
+		THROW_ERROR("Unable to allocate system file object for package '%s'.", piece_urls[0]);
+	}
+	if (!sfo_load_from_file(sfo, param_sfo_path)) {
+		THROW_ERROR("Unable to load system file object for package '%s'.", piece_urls[0]);
+	}
+
+	snprintf(title_entry_key, sizeof(title_entry_key), "TITLE_%02d", lang_id);
+	sfo_entry = sfo_find_entry(sfo, title_entry_key);
+	if (!sfo_entry) {
+		strlcpy(title_entry_key, "TITLE", sizeof(title_entry_key));
+		sfo_entry = sfo_find_entry(sfo, title_entry_key);
+		if (!sfo_entry) {
+			THROW_ERROR("Unable to get title for package '%s'.", piece_urls[0]);
+		}
+	}
+	if (sfo_entry->format != SFO_FORMAT_STRING || sfo_entry->size < 1) {
+		THROW_ERROR("Invalid format of '%s' entry in system file object for package '%s'.", title_entry_key, piece_urls[0]);
+	}
+	strlcpy(title_name, (const char*)sfo_entry->value, sizeof(title_name));
+
+	if (!http_escape_json_string(escaped_title_name, sizeof(escaped_title_name), title_name)) {
+		THROW_ERROR("Unable to escape title name.");
+	}
+
+	sfo_entry = sfo_find_entry(sfo, "CONTENT_ID");
+	if (!sfo_entry) {
+		THROW_ERROR("Unable to get content id for package '%s'.", piece_urls[0]);
+	}
+	if (sfo_entry->format != SFO_FORMAT_STRING || sfo_entry->size != sizeof(content_id)) {
+		THROW_ERROR("Invalid format of '%s' entry in system file object for package '%s'.", "CONTENT_ID", piece_urls[0]);
+	}
+	strlcpy(content_id, (const char*)sfo_entry->value, sizeof(content_id));
+
+	snprintf(content_url, sizeof(content_url), "http://%s:%d/static/%s.json", s_ip_address, s_port, tmp_name);
+	snprintf(icon_path, sizeof(icon_path), "/user%s/%s.png", s_work_dir, tmp_name);
+
+	if (bgft_download_register_package_task(content_id, content_url, title_name, has_icon ? icon_path : NULL, package_type, package_sub_type, package_size, is_patch, &task_id, &ret)) {
+		kick_result_header_json(s);
+		sb_writef(s, "{ \"status\": \"success\", \"task_id\": %d, \"title\": \"%s\" }\n", task_id, escaped_title_name);
+	} else {
+		kick_error_json(s, ret);
+	}
+
+	/* The reference JSON and icon stay behind for BGFT to fetch over /static/;
+	   only the param.sfo has served its purpose. */
+	unlink(param_sfo_path);
+
+	sfo_free(sfo);
+
+	return true;
+
+err:
+	if (strlen(ref_pkg_json_path) > 0) {
+		unlink(ref_pkg_json_path);
+	}
+	if (strlen(param_sfo_path) > 0) {
+		unlink(param_sfo_path);
+	}
+	if (strlen(icon0_png_path) > 0) {
+		unlink(icon0_png_path);
+	}
+
+	if (sfo) {
+		sfo_free(sfo);
+	}
+
+	return false;
+}
+
+static void free_piece_urls(char** piece_urls, size_t piece_count) {
+	size_t i;
+
+	if (!piece_urls) {
+		return;
+	}
+
+	for (i = 0; i < piece_count; ++i) {
+		free(piece_urls[i]);
+	}
+	free(piece_urls);
+}
+
+/* "direct": the client hands us the piece URLs. */
+static bool handle_api_install_direct(sb_Stream* s, struct request* req, int ssl_verify) {
+	const json_t* field;
+	union json_value_t val, child_val;
+	char** piece_urls = NULL;
+	char* unescaped_url = NULL;
+	size_t unescaped_url_size;
+	size_t piece_count;
+	size_t i;
+	bool status;
+
+	field = request_field(req, "packages", JSON_ARRAY);
 	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "packages");
+		return false;
 	}
-	if (json_getType(field) != JSON_ARRAY) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "packages");
-	}
+
 	for (val.jval = json_getChild(field), piece_count = 0; val.jval != NULL; val.jval = json_getSibling(val.jval)) {
 		if (json_getType(val.jval) != JSON_TEXT) {
 			THROW_ERROR("Invalid type for element of parameter '%s'.", "packages");
@@ -361,606 +541,159 @@ static inline bool handle_api_install_direct(sb_Stream* s, const json_t* root) {
 			THROW_ERROR("Unable to unescape element value of parameter '%s'.", "packages");
 		}
 
-		char *dst = encodeURI(unescaped_url);
-
-		piece_urls[i++] = dst;
-		unescaped_url = NULL;
-		dst = NULL;
-	}
-
-	snprintf(tmp_name, sizeof(tmp_name), "tmp_%" PRIxMAX, (uintmax_t)(s->init_time) ^ (uint32_t)(uintptr_t)s);
-
-	snprintf(ref_pkg_json_path, sizeof(ref_pkg_json_path), "%s/%s.json", s_work_dir, tmp_name);
-	snprintf(param_sfo_path, sizeof(param_sfo_path), "%s/%s.sfo", s_work_dir, tmp_name);
-	snprintf(icon0_png_path, sizeof(icon0_png_path), "%s/%s.png", s_work_dir, tmp_name);
-
-	memset(error_buf, 0, sizeof(error_buf));
-	if (!pkg_setup_prerequisites(piece_urls, piece_count, ref_pkg_json_path, param_sfo_path, icon0_png_path, &content_type, &package_size, &is_patch, &has_icon, error_buf, sizeof(error_buf))) {
-		rtrim(error_buf);
-		if (*error_buf != '\0')
-			THROW_ERROR("Unable to set up prerequisites for package '%s': %s", piece_urls[0], error_buf);
-		else
-			THROW_ERROR("Unable to set up prerequisites for package '%s'.", piece_urls[0]);
-	}
-
-	switch (content_type) {
-		case PKG_CONTENT_TYPE_GD: package_type = "PS4GD"; break;
-		case PKG_CONTENT_TYPE_AC: package_type = "PS4AC"; break;
-		case PKG_CONTENT_TYPE_AL: package_type = "PS4AL"; break;
-		case PKG_CONTENT_TYPE_DP: package_type = "PS4DP"; break;
-		default:
-			package_type = NULL;
-			THROW_ERROR("Unsupported content type for package '%s'.", piece_urls[0]);
-			break;
-	}
-
-	sfo = sfo_alloc();
-	if (!sfo) {
-		THROW_ERROR("Unable to allocate system file object for package '%s'.", piece_urls[0]);
-	}
-	if (!sfo_load_from_file(sfo, param_sfo_path)) {
-		THROW_ERROR("Unable to load system file object for package '%s'.", piece_urls[0]);
-	}
-
-	snprintf(title_entry_key, sizeof(title_entry_key), "TITLE_%02d", lang_id);
-	sfo_entry = sfo_find_entry(sfo, title_entry_key);
-	if (!sfo_entry) {
-		strlcpy(title_entry_key, "TITLE", sizeof(title_entry_key));
-		sfo_entry = sfo_find_entry(sfo, title_entry_key);
-		if (!sfo_entry) {
-			THROW_ERROR("Unable to get title for package '%s'.", piece_urls[0]);
-		}
-	}
-	if (sfo_entry->format != SFO_FORMAT_STRING || sfo_entry->size < 1) {
-		THROW_ERROR("Invalid format of '%s' entry in system file object for package '%s'.", title_entry_key, piece_urls[0]);
-	}
-	strlcpy(title_name, (const char*)sfo_entry->value, sizeof(title_name));
-
-	if (!http_escape_json_string(escaped_title_name, sizeof(escaped_title_name), title_name)) {
-		THROW_ERROR("Unable to escape title name.");
-	}
-
-	sfo_entry = sfo_find_entry(sfo, "CONTENT_ID");
-	if (!sfo_entry) {
-		THROW_ERROR("Unable to get content id for package '%s'.", piece_urls[0]);
-	}
-	if (sfo_entry->format != SFO_FORMAT_STRING || sfo_entry->size != sizeof(content_id)) {
-		THROW_ERROR("Invalid format of '%s' entry in system file object for package '%s'.", "CONTENT_ID", piece_urls[0]);
-	}
-	strlcpy(content_id, (const char*)sfo_entry->value, sizeof(content_id));
-
-	snprintf(content_url, sizeof(content_url), "http://%s:%d/static/%s.json", s_ip_address, s_port, tmp_name);
-	snprintf(icon_path, sizeof(icon_path), "/user%s/%s.png", s_work_dir, tmp_name);
-
-	if (bgft_download_register_package_task(content_id, content_url, title_name, has_icon ? icon_path : NULL, package_type, package_sub_type, package_size, is_patch, &task_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\", \"task_id\": %d, \"title\": \"%s\" }\n", task_id, escaped_title_name);
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	unlink(param_sfo_path);
-
-	if (sfo) {
-		sfo_free(sfo);
-	}
-
-	if (piece_urls) {
-		for (i = 0; i < piece_count; ++i) {
-			free(piece_urls[i]);
-		}
-		free(piece_urls);
-	}
-
-	if (unescaped_url) {
+		/* Re-encode so paths containing spaces or non-ASCII survive the trip
+		   to the package host. */
+		piece_urls[i] = url_encode(unescaped_url);
 		free(unescaped_url);
+		unescaped_url = NULL;
+		if (!piece_urls[i]) {
+			THROW_ERROR("No memory.");
+		}
+		++i;
 	}
 
-	return true;
+	status = install_pieces(s, piece_urls, piece_count, ssl_verify);
+
+	free_piece_urls(piece_urls, piece_count);
+
+	return status;
 
 err:
-	if (strlen(ref_pkg_json_path) > 0) {
-		unlink(ref_pkg_json_path);
-	}
-	if (strlen(param_sfo_path) > 0) {
-		unlink(param_sfo_path);
-	}
-	if (strlen(icon0_png_path) > 0) {
-		unlink(icon0_png_path);
-	}
-
-	if (sfo) {
-		sfo_free(sfo);
-	}
-
-	if (piece_urls) {
-		for (i = 0; i < piece_count; ++i) {
-			free(piece_urls[i]);
-		}
-		free(piece_urls);
-	}
-
-	if (unescaped_url) {
-		free(unescaped_url);
-	}
+	free(unescaped_url);
+	free_piece_urls(piece_urls, piece_count);
 
 	return false;
 }
 
-static inline bool handle_api_install_ref_pkg_url(sb_Stream* s, const json_t* root) {
-	const json_t* field;
-	union json_value_t val;
+/* "ref_pkg_url": the piece URLs come from a reference JSON we fetch. */
+static bool handle_api_install_ref_pkg_url(sb_Stream* s, struct request* req, int ssl_verify) {
+	const char* url_val;
 	char* unescaped_url = NULL;
 	size_t unescaped_url_size;
 	char** piece_urls = NULL;
-	size_t piece_count;
-	char tmp_name[32];
-	char ref_pkg_json_path[1024];
-	char param_sfo_path[1024];
-	char icon0_png_path[1024];
-	struct sfo* sfo = NULL;
-	struct sfo_entry* sfo_entry;
-	char title_entry_key[16];
-	char title_name[256];
-	char escaped_title_name[256 * 2 + 1];
-	char content_id[PKG_CONTENT_ID_SIZE + 1];
-	char content_url[256];
-	char icon_path[256];
-	char error_buf[256];
-	enum pkg_content_type content_type;
-	const char* package_type;
-	const char* package_sub_type = NULL;
-	uint64_t package_size;
-	bool is_patch;
-	bool has_icon = false;
-	int lang_id;
-	int task_id = -1;
-	size_t i;
-	int ret;
+	size_t piece_count = 0;
+	bool status;
 
-	memset(ref_pkg_json_path, 0, sizeof(ref_pkg_json_path));
-	memset(param_sfo_path, 0, sizeof(param_sfo_path));
-	memset(icon0_png_path, 0, sizeof(icon0_png_path));
-
-	if (!get_language_id(&lang_id)) {
-		THROW_ERROR("Unable to get language id.");
+	if (!request_str(req, "url", &url_val)) {
+		return false;
 	}
-
-	field = json_getProperty(root, "url");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "url");
-	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "url");
-	}
-	val.sval = json_getValue(field);
-	if (strlen(val.sval) == 0) {
+	if (strlen(url_val) == 0) {
 		THROW_ERROR("Empty element value of parameter '%s'.", "url");
 	}
 
-	if (!http_unescape_uri(&unescaped_url, &unescaped_url_size, val.sval)) {
+	if (!http_unescape_uri(&unescaped_url, &unescaped_url_size, url_val)) {
 		THROW_ERROR("Unable to unescape element value of parameter '%s'.", "url");
 	}
 
 	if (!starts_with(unescaped_url, "http://") && !starts_with(unescaped_url, "https://")) {
-		free(unescaped_url);
-		unescaped_url = NULL;
 		THROW_ERROR("Unexpected element value of parameter '%s'.", "url");
 	}
 
-	piece_urls = pkg_extract_piece_urls_from_ref_pkg_json(unescaped_url, &piece_count);
+	piece_urls = pkg_extract_piece_urls_from_ref_pkg_json(unescaped_url, &piece_count, ssl_verify);
 	if (!piece_urls) {
-		THROW_ERROR("Unable to extract pieces URLs for %s'.", unescaped_url);
+		THROW_ERROR("Unable to extract pieces URLs for '%s'.", unescaped_url);
 	}
 
-	snprintf(tmp_name, sizeof(tmp_name), "tmp_%" PRIxMAX, (uintmax_t)(s->init_time) ^ (uint32_t)(uintptr_t)s);
+	status = install_pieces(s, piece_urls, piece_count, ssl_verify);
 
-	snprintf(ref_pkg_json_path, sizeof(ref_pkg_json_path), "%s/%s.json", s_work_dir, tmp_name);
-	snprintf(param_sfo_path, sizeof(param_sfo_path), "%s/%s.sfo", s_work_dir, tmp_name);
-	snprintf(icon0_png_path, sizeof(icon0_png_path), "%s/%s.png", s_work_dir, tmp_name);
+	free_piece_urls(piece_urls, piece_count);
+	free(unescaped_url);
 
-	memset(error_buf, 0, sizeof(error_buf));
-	if (!pkg_setup_prerequisites(piece_urls, piece_count, ref_pkg_json_path, param_sfo_path, icon0_png_path, &content_type, &package_size, &is_patch, &has_icon, error_buf, sizeof(error_buf))) {
-		rtrim(error_buf);
-		if (*error_buf != '\0')
-			THROW_ERROR("Unable to set up prerequisites for package '%s': %s", piece_urls[0], error_buf);
-		else
-			THROW_ERROR("Unable to set up prerequisites for package '%s'.", piece_urls[0]);
-	}
-
-	switch (content_type) {
-		case PKG_CONTENT_TYPE_GD: package_type = "PS4GD"; break;
-		case PKG_CONTENT_TYPE_AC: package_type = "PS4AC"; break;
-		case PKG_CONTENT_TYPE_AL: package_type = "PS4AL"; break;
-		case PKG_CONTENT_TYPE_DP: package_type = "PS4DP"; break;
-		default:
-			package_type = NULL;
-			THROW_ERROR("Unsupported content type for package '%s'.", piece_urls[0]);
-			break;
-	}
-
-	sfo = sfo_alloc();
-	if (!sfo) {
-		THROW_ERROR("Unable to allocate system file object for package '%s'.", piece_urls[0]);
-	}
-	if (!sfo_load_from_file(sfo, param_sfo_path)) {
-		THROW_ERROR("Unable to load system file object for package '%s'.", piece_urls[0]);
-	}
-
-	snprintf(title_entry_key, sizeof(title_entry_key), "TITLE_%02d", lang_id);
-	sfo_entry = sfo_find_entry(sfo, title_entry_key);
-	if (!sfo_entry) {
-		strlcpy(title_entry_key, "TITLE", sizeof(title_entry_key));
-		sfo_entry = sfo_find_entry(sfo, title_entry_key);
-		if (!sfo_entry) {
-			THROW_ERROR("Unable to get title for package '%s'.", piece_urls[0]);
-		}
-	}
-	if (sfo_entry->format != SFO_FORMAT_STRING || sfo_entry->size < 1) {
-		THROW_ERROR("Invalid format of '%s' entry in system file object for package '%s'.", title_entry_key, piece_urls[0]);
-	}
-	strlcpy(title_name, (const char*)sfo_entry->value, sizeof(title_name));
-
-	if (!http_escape_json_string(escaped_title_name, sizeof(escaped_title_name), title_name)) {
-		THROW_ERROR("Unable to escape title name.");
-	}
-
-	sfo_entry = sfo_find_entry(sfo, "CONTENT_ID");
-	if (!sfo_entry) {
-		THROW_ERROR("Unable to get content id for package '%s'.", piece_urls[0]);
-	}
-	if (sfo_entry->format != SFO_FORMAT_STRING || sfo_entry->size != sizeof(content_id)) {
-		THROW_ERROR("Invalid format of '%s' entry in system file object for package '%s'.", "CONTENT_ID", piece_urls[0]);
-	}
-	strlcpy(content_id, (const char*)sfo_entry->value, sizeof(content_id));
-
-	snprintf(content_url, sizeof(content_url), "http://%s:%d/static/%s.json", s_ip_address, s_port, tmp_name);
-	snprintf(icon_path, sizeof(icon_path), "/user%s/%s.png", s_work_dir, tmp_name);
-
-	if (bgft_download_register_package_task(content_id, content_url, title_name, has_icon ? icon_path : NULL, package_type, package_sub_type, package_size, is_patch, &task_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\", \"task_id\": %d, \"title\": \"%s\" }\n", task_id, escaped_title_name);
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	unlink(param_sfo_path);
-
-	if (sfo) {
-		sfo_free(sfo);
-	}
-
-	if (unescaped_url) {
-		free(unescaped_url);
-	}
-
-	if (piece_urls) {
-		for (i = 0; i < piece_count; ++i) {
-			free(piece_urls[i]);
-		}
-		free(piece_urls);
-	}
-
-	return true;
+	return status;
 
 err:
-	if (strlen(ref_pkg_json_path) > 0) {
-		unlink(ref_pkg_json_path);
-	}
-	if (strlen(param_sfo_path) > 0) {
-		unlink(param_sfo_path);
-	}
-	if (strlen(icon0_png_path) > 0) {
-		unlink(icon0_png_path);
-	}
-
-	if (sfo) {
-		sfo_free(sfo);
-	}
-
-	if (unescaped_url) {
-		free(unescaped_url);
-	}
-
-	if (piece_urls) {
-		for (i = 0; i < piece_count; ++i) {
-			free(piece_urls[i]);
-		}
-		free(piece_urls);
-	}
+	free_piece_urls(piece_urls, piece_count);
+	free(unescaped_url);
 
 	return false;
 }
 
 static bool handle_api_install(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	union json_value_t val;
-	bool status;
+	struct request req;
+	const char* type;
+	bool verify;
+	int ssl_verify = HTTP_SSL_VERIFY_DEFAULT;
 
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
-	assert(in_data != NULL);
 
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
+	UNUSED(in_size);
 
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
+	if (!request_parse(&req, s, in_data)) {
+		return false;
 	}
 
-	field = json_getProperty(root, "type");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "type");
+	/* Optional per-install override of the configured TLS policy, for hosts
+	   with a self-signed certificate. */
+	verify = (http_get_ssl_verify() == HTTP_SSL_VERIFY_ON);
+	if (!request_bool_opt(&req, "ssl_verify", &verify)) {
+		return false;
 	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "type");
-	}
-	val.sval = json_getValue(field);
-	if (strcasecmp(val.sval, "direct") == 0) {
-		status = handle_api_install_direct(s, root);
-	} else if (strcasecmp(val.sval, "ref_pkg_url") == 0) {
-		status = handle_api_install_ref_pkg_url(s, root);
-	} else {
-		THROW_ERROR("Invalid type '%s'.", val.sval);
+	ssl_verify = verify ? HTTP_SSL_VERIFY_ON : HTTP_SSL_VERIFY_OFF;
+
+	if (!request_str(&req, "type", &type)) {
+		return false;
 	}
 
-	if (pool) {
-		free(pool);
+	if (strcasecmp(type, "direct") == 0) {
+		return handle_api_install_direct(s, &req, ssl_verify);
+	}
+	if (strcasecmp(type, "ref_pkg_url") == 0) {
+		return handle_api_install_ref_pkg_url(s, &req, ssl_verify);
 	}
 
-	return status;
-
-err:
-	if (pool) {
-		free(pool);
-	}
+	kick_errorf(s, 400, "Bad request", "Invalid type '%s'.", type);
 
 	return false;
 }
 
-static bool handle_api_uninstall_game(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	char title_id[PKG_TITLE_ID_SIZE + 1];
-	union json_value_t val;
+/*
+ * Uninstall / query.
+ */
+
+static bool handle_api_uninstall(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
+	struct request req;
+	char id[PKG_CONTENT_ID_SIZE + 1];
+	size_t i;
 	int ret;
 
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
-	assert(in_data != NULL);
 
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
+	UNUSED(in_size);
+
+	for (i = 0; i < ARRAY_SIZE(s_uninstall_actions); ++i) {
+		if (strcmp(path, s_uninstall_actions[i].path) == 0) {
+			break;
+		}
 	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
+	if (i == ARRAY_SIZE(s_uninstall_actions)) {
+		kick_error(s, 404, "Not found", "Unknown uninstall action");
+		return false;
 	}
 
-	field = json_getProperty(root, "title_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "title_id");
+	if (!request_parse(&req, s, in_data)) {
+		return false;
 	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "title_id");
+	if (!request_id(&req, s_uninstall_actions[i].field, id, s_uninstall_actions[i].id_size)) {
+		return false;
 	}
-	val.sval = json_getValue(field);
 
-	strlcpy(title_id, val.sval, sizeof(title_id));
-
-	if (app_inst_util_uninstall_game(title_id, &ret)) {
+	if ((*s_uninstall_actions[i].fn)(id, &ret)) {
 		kick_result_header_json(s);
 		sb_writef(s, "{ \"status\": \"success\" }\n");
 	} else {
 		kick_error_json(s, ret);
 	}
 
-	if (pool) {
-		free(pool);
-	}
-
 	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_uninstall_ac(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	char content_id[PKG_CONTENT_ID_SIZE + 1];
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "content_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "content_id");
-	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "content_id");
-	}
-	val.sval = json_getValue(field);
-
-	strlcpy(content_id, val.sval, sizeof(content_id));
-
-	if (app_inst_util_uninstall_ac(content_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_uninstall_patch(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	char title_id[PKG_TITLE_ID_SIZE + 1];
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "title_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "title_id");
-	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "title_id");
-	}
-	val.sval = json_getValue(field);
-
-	strlcpy(title_id, val.sval, sizeof(title_id));
-
-	if (app_inst_util_uninstall_patch(title_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_uninstall_theme(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	char content_id[PKG_CONTENT_ID_SIZE + 1];
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "content_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "content_id");
-	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "content_id");
-	}
-	val.sval = json_getValue(field);
-
-	strlcpy(content_id, val.sval, sizeof(content_id));
-
-	if (app_inst_util_uninstall_theme(content_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
 }
 
 static bool handle_api_is_exists(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
+	struct request req;
 	char title_id[PKG_TITLE_ID_SIZE + 1];
-	union json_value_t val;
 	unsigned long size;
 	bool exists;
 	int ret;
@@ -968,29 +701,15 @@ static bool handle_api_is_exists(sb_Stream* s, const char* method, const char* p
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
-	assert(in_data != NULL);
 
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
+	UNUSED(in_size);
 
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
+	if (!request_parse(&req, s, in_data)) {
+		return false;
 	}
-
-	field = json_getProperty(root, "title_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "title_id");
+	if (!request_id(&req, "title_id", title_id, sizeof(title_id))) {
+		return false;
 	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "title_id");
-	}
-	val.sval = json_getValue(field);
-
-	strlcpy(title_id, val.sval, sizeof(title_id));
 
 	if (app_inst_util_is_exists(title_id, &exists, &ret)) {
 		kick_result_header_json(s);
@@ -1006,358 +725,69 @@ static bool handle_api_is_exists(sb_Stream* s, const char* method, const char* p
 		kick_error_json(s, ret);
 	}
 
-	if (pool) {
-		free(pool);
-	}
-
 	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
 }
 
-static bool handle_api_start_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
+/*
+ * Download tasks.
+ */
+
+static bool handle_api_task_action(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
+	struct request req;
 	int task_id;
-	union json_value_t val;
+	size_t i;
 	int ret;
 
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
-	assert(in_data != NULL);
 
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
+	UNUSED(in_size);
 
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
+	for (i = 0; i < ARRAY_SIZE(s_task_actions); ++i) {
+		if (strcmp(path, s_task_actions[i].path) == 0) {
+			break;
+		}
 	}
-
-	field = json_getProperty(root, "task_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "task_id");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "task_id");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	task_id = val.ival;
-	if (task_id < 0) {
-		THROW_ERROR("Invalid value for '%s' parameter specified.", "task_id");
+	if (i == ARRAY_SIZE(s_task_actions)) {
+		kick_error(s, 404, "Not found", "Unknown task action");
+		return false;
 	}
 
-	if (bgft_download_start_task(task_id, &ret)) {
+	if (!request_parse(&req, s, in_data)) {
+		return false;
+	}
+	if (!request_task_id(&req, &task_id)) {
+		return false;
+	}
+
+	if ((*s_task_actions[i].fn)(task_id, &ret)) {
 		kick_result_header_json(s);
 		sb_writef(s, "{ \"status\": \"success\" }\n");
 	} else {
 		kick_error_json(s, ret);
 	}
 
-	if (pool) {
-		free(pool);
-	}
-
 	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_stop_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	int task_id;
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "task_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "task_id");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "task_id");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	task_id = val.ival;
-	if (task_id < 0) {
-		THROW_ERROR("Invalid value for '%s' parameter specified.", "task_id");
-	}
-
-	if (bgft_download_stop_task(task_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_pause_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	int task_id;
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "task_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "task_id");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "task_id");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	task_id = val.ival;
-	if (task_id < 0) {
-		THROW_ERROR("Invalid value for '%s' parameter specified.", "task_id");
-	}
-
-	if (bgft_download_pause_task(task_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_resume_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	int task_id;
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "task_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "task_id");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "task_id");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	task_id = val.ival;
-	if (task_id < 0) {
-		THROW_ERROR("Invalid value for '%s' parameter specified.", "task_id");
-	}
-
-	if (bgft_download_resume_task(task_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
-}
-
-static bool handle_api_unregister_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	int task_id;
-	union json_value_t val;
-	int ret;
-
-	assert(s != NULL);
-	assert(method != NULL);
-	assert(path != NULL);
-	assert(in_data != NULL);
-
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
-
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
-	}
-
-	field = json_getProperty(root, "task_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "task_id");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "task_id");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	task_id = val.ival;
-	if (task_id < 0) {
-		THROW_ERROR("Invalid value for '%s' parameter specified.", "task_id");
-	}
-
-	if (bgft_download_unregister_task(task_id, &ret)) {
-		kick_result_header_json(s);
-		sb_writef(s, "{ \"status\": \"success\" }\n");
-	} else {
-		kick_error_json(s, ret);
-	}
-
-	if (pool) {
-		free(pool);
-	}
-
-	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
 }
 
 static bool handle_api_get_task_progress(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	int task_id;
+	struct request req;
 	struct bgft_download_task_progress_info progress_info;
-	union json_value_t val;
+	int task_id;
 	int ret;
 
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
-	assert(in_data != NULL);
 
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
+	UNUSED(in_size);
 
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
+	if (!request_parse(&req, s, in_data)) {
+		return false;
 	}
-
-	field = json_getProperty(root, "task_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "task_id");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "task_id");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	task_id = val.ival;
-	if (task_id < 0) {
-		THROW_ERROR("Invalid value for '%s' parameter specified.", "task_id");
+	if (!request_task_id(&req, &task_id)) {
+		return false;
 	}
 
 	if (bgft_download_get_task_progress(task_id, &progress_info, &ret)) {
@@ -1372,26 +802,11 @@ static bool handle_api_get_task_progress(sb_Stream* s, const char* method, const
 		kick_error_json(s, ret);
 	}
 
-	if (pool) {
-		free(pool);
-	}
-
 	return true;
-
-err:
-	if (pool) {
-		free(pool);
-	}
-
-	return false;
 }
 
 static bool handle_api_find_task(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
-	static json_t* pool = NULL;
-	const size_t pool_size = 256;
-	const json_t* root;
-	const json_t* field;
-	union json_value_t val;
+	struct request req;
 	char content_id[PKG_CONTENT_ID_SIZE + 1];
 	int sub_type;
 	int task_id = -1;
@@ -1400,40 +815,18 @@ static bool handle_api_find_task(sb_Stream* s, const char* method, const char* p
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
-	assert(in_data != NULL);
 
-	pool = (json_t*)malloc(sizeof(*pool) * pool_size);
-	if (!pool) {
-		THROW_ERROR("No memory.");
-	}
-	memset(pool, 0, sizeof(*pool) * pool_size);
+	UNUSED(in_size);
 
-	root = json_create(in_data, pool, pool_size);
-	if (!root) {
-		THROW_ERROR("Invalid JSON format.");
+	if (!request_parse(&req, s, in_data)) {
+		return false;
 	}
-
-	field = json_getProperty(root, "content_id");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "content_id");
+	if (!request_id(&req, "content_id", content_id, sizeof(content_id))) {
+		return false;
 	}
-	if (json_getType(field) != JSON_TEXT) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "content_id");
+	if (!request_int(&req, "sub_type", &sub_type)) {
+		return false;
 	}
-	val.sval = json_getValue(field);
-
-	strlcpy(content_id, val.sval, sizeof(content_id));
-
-	field = json_getProperty(root, "sub_type");
-	if (!field) {
-		THROW_ERROR("No '%s' parameter specified.", "sub_type");
-	}
-	if (json_getType(field) != JSON_INTEGER) {
-		THROW_ERROR("Invalid type for parameter '%s'.", "sub_type");
-	}
-	val.ival = (int)json_getInteger(field);
-
-	sub_type = val.ival;
 
 	if (bgft_download_find_task_by_content_id(content_id, sub_type, &task_id, &ret)) {
 		kick_result_header_json(s);
@@ -1442,19 +835,78 @@ static bool handle_api_find_task(sb_Stream* s, const char* method, const char* p
 		kick_error_json(s, ret);
 	}
 
-	if (pool) {
-		free(pool);
+	return true;
+}
+
+/*
+ * Settings.
+ */
+
+static void write_settings_json(sb_Stream* s) {
+	char escaped_path[512];
+
+	if (!http_escape_json_string(escaped_path, sizeof(escaped_path), http_get_ca_bundle_path())) {
+		strlcpy(escaped_path, "", sizeof(escaped_path));
 	}
+
+	kick_result_header_json(s);
+	sb_writef(s, "{ \"status\": \"success\", \"ssl_verify\": %s, \"ca_bundle\": \"%s\", \"ca_bundle_loaded\": %s }\n",
+		http_get_ssl_verify() == HTTP_SSL_VERIFY_ON ? "true" : "false",
+		escaped_path,
+		http_has_ca_bundle() ? "true" : "false");
+}
+
+static bool handle_api_settings(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
+	struct request req;
+	const char* ca_bundle = NULL;
+	bool verify;
+
+	assert(s != NULL);
+	assert(method != NULL);
+	assert(path != NULL);
+
+	UNUSED(in_size);
+
+	/* A GET with no payload just reports the current settings. */
+	if (strcasecmp(method, "GET") == 0 && (!in_data || *in_data == '\0')) {
+		write_settings_json(s);
+		return true;
+	}
+
+	if (!request_parse(&req, s, in_data)) {
+		return false;
+	}
+
+	verify = (http_get_ssl_verify() == HTTP_SSL_VERIFY_ON);
+	if (!request_bool_opt(&req, "ssl_verify", &verify)) {
+		return false;
+	}
+	http_set_ssl_verify(verify ? HTTP_SSL_VERIFY_ON : HTTP_SSL_VERIFY_OFF);
+
+	if (json_getProperty(req.root, "ca_bundle")) {
+		if (!request_str(&req, "ca_bundle", &ca_bundle)) {
+			return false;
+		}
+		if (!http_load_ca_bundle(ca_bundle)) {
+			THROW_ERROR("Unable to load CA bundle '%s': %s", ca_bundle, http_get_last_error());
+		}
+	}
+
+	if (!http_save_config(HTTP_CONFIG_PATH)) {
+		THROW_ERROR("Unable to save settings to '%s'.", HTTP_CONFIG_PATH);
+	}
+
+	write_settings_json(s);
 
 	return true;
 
 err:
-	if (pool) {
-		free(pool);
-	}
-
 	return false;
 }
+
+/*
+ * Static files.
+ */
 
 static bool handle_static(sb_Stream* s, const char* method, const char* path, char* in_data, size_t in_size) {
 	struct stat stbuf;
@@ -1465,6 +917,9 @@ static bool handle_static(sb_Stream* s, const char* method, const char* path, ch
 	assert(s != NULL);
 	assert(method != NULL);
 	assert(path != NULL);
+
+	UNUSED(in_data);
+	UNUSED(in_size);
 
 	if (!starts_with(path, "/static/") || strstr(path, ":/") || strstr(path, "..")) {
 		kick_error(s, 400, "Bad request", "Invalid path");
@@ -1510,6 +965,10 @@ done:
 	return (ret == SB_RES_OK);
 }
 
+/*
+ * Responses.
+ */
+
 static void set_cors_header(sb_Stream* s) {
 	sb_send_header(s, "Content-Type", "application/json");
 	sb_send_header(s, "Access-Control-Allow-Origin", "*");
@@ -1535,6 +994,17 @@ static void kick_error(sb_Stream* s, int code, const char* title, const char* er
 	sb_writef(s, "{ \"status\": \"fail\", \"error\": \"%s\" }\n", escaped_error);
 }
 
+static void kick_errorf(sb_Stream* s, int code, const char* title, const char* format, ...) {
+	char buf[512];
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf(buf, sizeof(buf), format, args);
+	va_end(args);
+
+	kick_error(s, code, title, buf);
+}
+
 static void kick_result_header_json(sb_Stream* s) {
 	sb_send_status(s, 200, "OK");
 	set_cors_header(s);
@@ -1546,9 +1016,80 @@ static void kick_error_json(sb_Stream* s, int code) {
 	sb_writef(s, "{ \"status\": \"fail\", \"error_code\": 0x%08X }\n", code);
 }
 
-static void kick_success_json(sb_Stream* s) {
-	kick_result_header_json(s);
-	sb_writef(s, "{ \"status\": \"success\" }\n");
+/*
+ * Dispatch.
+ */
+
+static int event_handler(sb_Event* e) {
+	char query_buf[QUERY_DATA_SIZE];
+	const struct handler_desc* desc = NULL;
+	unsigned int wanted;
+	char* data = NULL;
+	size_t data_size = 0;
+	size_t i;
+
+	sb_Stream* st = e->stream;
+	const char* path = e->path;
+	const char* method = e->method;
+
+	if (e->type != SB_EV_REQUEST) {
+		return SB_RES_OK;
+	}
+
+	if (strcasecmp(method, "OPTIONS") == 0) {
+		kick_result_header_json(st);
+		return SB_RES_OK;
+	} else if (strcasecmp(method, "GET") == 0) {
+		wanted = METHOD_GET;
+	} else if (strcasecmp(method, "POST") == 0) {
+		wanted = METHOD_POST;
+	} else {
+		kick_error(st, 400, "Bad request", "Unsupported method");
+		return SB_RES_OK;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(s_handlers); ++i) {
+		if (!(s_handlers[i].methods & wanted)) {
+			continue;
+		}
+		if (s_handlers[i].need_partial_match) {
+			if (strstr(path, s_handlers[i].path) == path) {
+				desc = &s_handlers[i];
+				break;
+			}
+		} else if (strcmp(path, s_handlers[i].path) == 0) {
+			desc = &s_handlers[i];
+			break;
+		}
+	}
+	if (!desc) {
+		kick_error(st, 404, "Not found", "Unknown endpoint");
+		return SB_RES_OK;
+	}
+
+	if (wanted == METHOD_POST) {
+		/* data_idx is zero when the request carried no body at all. */
+		if (st->data_idx > 0 && st->expected_recv_len > st->data_idx) {
+			data = st->recv_buf.s + st->data_idx;
+			data_size = st->expected_recv_len - st->data_idx;
+		}
+	} else {
+		switch (sb_get_var(st, "data", query_buf, sizeof(query_buf))) {
+			case SB_ESUCCESS:
+				data = query_buf;
+				data_size = strlen(query_buf);
+				break;
+			case SB_ETRUNCATED:
+				kick_error(st, 400, "Bad request", "Query data too long");
+				return SB_RES_OK;
+			default:
+				break;
+		}
+	}
+
+	(*desc->handler)(st, method, path, data, data_size);
+
+	return SB_RES_OK;
 }
 
 static void cleanup_temp_files(void) {
@@ -1582,7 +1123,7 @@ static void cleanup_temp_files(void) {
 			break;
 		}
 		entry = (struct dirent*)buf;
-		
+
 		// #define DT_UNKNOWN 0
 		while (entry->d_fileno != 0)
 		{
@@ -1618,23 +1159,4 @@ err:
 			EPRINTF("sceKernelClose failed: 0x%08X\n", ret);
 		}
 	}
-}
-
-/* Converts an integer value to its hex character*/
-char to_hex(char code) {
-  static char hex[] = "0123456789abcdef";
-  return hex[code & 15];
-}
-
-char *encodeURI(char *str) {
-  char *pstr = str, *buf = malloc(strlen(str) * 3 + 1), *pbuf = buf;
-  while (*pstr) {
-    if (isalnum(*pstr) || *pstr == '-' || *pstr == '_' || *pstr == '.' || *pstr == '~' || *pstr == '+' || *pstr == ':' || *pstr == '/' || *pstr == '@') 
-      *pbuf++ = *pstr;
-    else 
-      *pbuf++ = '%', *pbuf++ = to_hex(*pstr >> 4), *pbuf++ = to_hex(*pstr & 15);
-    pstr++;
-  }
-  *pbuf = '\0';
-  return buf;
 }

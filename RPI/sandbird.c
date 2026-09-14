@@ -729,20 +729,6 @@ int sb_get_var(sb_Stream *st, const char *name, char *dst, size_t len) {
 }
 
 
-char *sb_get_content_data_bak(sb_Stream *st, size_t *len) {
-  if (st->data_idx) {
-    if (len) {
-      *len = st->expected_recv_len - st->data_idx;
-    }
-    return st->recv_buf.s + st->data_idx;
-  } else {
-    if (len) {
-      *len = 0;
-    }
-    return NULL;
-  }
-}
-
 
 int sb_get_cookie(sb_Stream *st, const char *name, char *dst, size_t len) {
   size_t n;

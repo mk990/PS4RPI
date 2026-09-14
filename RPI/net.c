@@ -9,6 +9,12 @@ static int s_libnet_mem_id = -1;
 
 static bool s_net_initialized = false;
 
+/* sceNetErrnoLoc() returns a pointer to this thread's libnet errno. */
+static inline int net_errno(void) {
+	int* loc = sceNetErrnoLoc();
+	return loc ? *loc : 0;
+}
+
 bool net_init(void) {
 	int ret;
 
@@ -24,13 +30,13 @@ bool net_init(void) {
 
 	ret = sceNetInit();
 	if (ret) {
-		EPRINTF("sceNetInit failed: 0x%08X\n", sceNetErrnoLoc);
+		EPRINTF("sceNetInit failed: 0x%08X\n", net_errno());
 		goto err_netctl_terminate;
 	}
 
 	ret = sceNetPoolCreate("remote_pkg_inst_net_pool", NET_HEAP_SIZE, 0);
 	if (ret < 0) {
-		EPRINTF("sceNetPoolCreate failed: 0x%08X\n", sceNetErrnoLoc);
+		EPRINTF("sceNetPoolCreate failed: 0x%08X\n", net_errno());
 		goto err_net_terminate;
 	}
 	s_libnet_mem_id = ret;
@@ -40,17 +46,10 @@ bool net_init(void) {
 done:
 	return true;
 
-err_pool_destroy:
-	ret = sceNetPoolDestroy(s_libnet_mem_id);
-	if (ret < 0) {
-		EPRINTF("sceNetPoolDestroy failed: 0x%08X\n", sceNetErrnoLoc());
-	}
-	s_libnet_mem_id = -1;
-
 err_net_terminate:
 	ret = sceNetTerm();
 	if (ret) {
-		EPRINTF("sceNetTerm failed: 0x%08X\n", sceNetErrnoLoc());
+		EPRINTF("sceNetTerm failed: 0x%08X\n", net_errno());
 	}
 
 err_netctl_terminate:
@@ -81,13 +80,13 @@ void net_fini(void) {
 
 	ret = sceNetPoolDestroy(s_libnet_mem_id);
 	if (ret < 0) {
-		EPRINTF("sceNetPoolDestroy failed: 0x%08X\n", sceNetErrnoLoc());
+		EPRINTF("sceNetPoolDestroy failed: 0x%08X\n", net_errno());
 	}
 	s_libnet_mem_id = -1;
 
 	ret = sceNetTerm();
 	if (ret < 0) {
-		EPRINTF("sceNetTerm failed: 0x%08X\n", sceNetErrnoLoc());
+		EPRINTF("sceNetTerm failed: 0x%08X\n", net_errno());
 	}
 
 	sceNetCtlTerm();
@@ -99,7 +98,7 @@ int net_get_ipv4(char* buf, size_t buf_size) {
 	OrbisNetCtlInfo info;
 	int ret;
 
-	if (buf_size < sizeof(info.ip_address)) {
+	if (!buf || buf_size < sizeof(info.ip_address)) {
 		ret = 0x80020016;
 		goto err;
 	}
@@ -111,70 +110,8 @@ int net_get_ipv4(char* buf, size_t buf_size) {
 		goto err;
 	}
 
-	strncpy(buf, info.ip_address, buf_size);
+	strlcpy(buf, info.ip_address, buf_size);
 
 err:
-	return ret;
-}
-
-int net_send_all(int sock_id, const void* data, size_t size, size_t* sent) {
-	uint8_t* ptr = (uint8_t*)data;
-	size_t total_sent = 0;
-	size_t cur_size;
-	int ret;
-
-	while (total_sent < size) {
-		cur_size = size - total_sent;
-
-		ret = sceNetSend(sock_id, ptr, cur_size, 0);
-		if (ret < 0) {
-			EPRINTF("sceNetSend failed: 0x%08X\n", sceNetErrnoLoc());
-			goto err;
-		}
-		if (ret == 0) {
-			break;
-		}
-
-		total_sent += ret;
-		ptr += ret;
-	}
-
-	ret = 0;
-
-err:
-	if (sent)
-		*sent = total_sent;
-
-	return ret;
-}
-
-int net_recv_all(int sock_id, void* data, size_t size, size_t* received) {
-	uint8_t* ptr = (uint8_t*)data;
-	size_t total_received = 0;
-	size_t cur_size;
-	int ret;
-
-	while (total_received < size) {
-		cur_size = size - total_received;
-
-		ret = sceNetRecv(sock_id, ptr, cur_size, 0);
-		if (ret < 0) {
-			EPRINTF("sceNetRecv failed: 0x%08X\n", sceNetErrnoLoc());
-			goto err;
-		}
-		if (ret == 0) {
-			break;
-		}
-
-		total_received += ret;
-		ptr += ret;
-	}
-
-	ret = 0;
-
-err:
-	if (received)
-		*received = total_received;
-
 	return ret;
 }

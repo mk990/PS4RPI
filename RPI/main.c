@@ -23,9 +23,6 @@ static bool s_modules_loaded = false;
 static bool load_modules(void);
 static void unload_modules(void);
 
-static void set_privileges(void);
-static void unset_privileges(void);
-
 static void cleanup(void);
 
 typedef struct {
@@ -43,19 +40,7 @@ typedef struct {
 	uint64_t sceProcCap;
 } jbc_cred;
 
-typedef enum {
-	USERSPACE,
-	KERNEL_HEAP,
-	KERNEL_TEXT
-} KmemKind;
-
-enum {
-	CWD_KEEP,
-	CWD_ROOT,
-	CWD_RESET,
-};
-
-jbc_cred jailbreak;
+jbc_cred jailbreak_cred;
 jbc_cred og;
 
 int(*jbc_get_cred)(jbc_cred *ans);
@@ -63,34 +48,51 @@ int(*jbc_jailbreak_cred)(jbc_cred *ans);
 int(*jbc_set_cred)(const jbc_cred *ans);
 
 
-void Jailbreak()
+static bool s_jailbroken = false;
+
+static void jailbreak(void)
 {
-	// unjail
-	int urmom = 0;
-	int32_t handlejbc = sceKernelLoadStartModule("/app0/sce_module/libjbc.prx", NULL, NULL, NULL, NULL, NULL);
-	KernelPrintOut("libjbc handle is 0x%lx\n", handlejbc);
+	int32_t handle = sceKernelLoadStartModule("/app0/sce_module/libjbc.prx", NULL, NULL, NULL, NULL, NULL);
+	int ret;
 
-	if (handlejbc > 0)
-	{
-		urmom = sceKernelDlsym(handlejbc, "jbc_get_cred", (void**)&jbc_get_cred);
-		KernelPrintOut("sceKernelDlsym returned 0x%lx\n", urmom);
+	KernelPrintOut("libjbc handle is 0x%lx\n", handle);
 
-
-		urmom = sceKernelDlsym(handlejbc, "jbc_jailbreak_cred", (void**)&jbc_jailbreak_cred);
-		KernelPrintOut("sceKernelDlsym returned 0x%lx\n", urmom);
-
-		urmom = sceKernelDlsym(handlejbc, "jbc_set_cred", (void**)&jbc_set_cred);
-		KernelPrintOut("sceKernelDlsym returned 0x%lx\n", urmom);
-	}
-	else
-	{
-		KernelPrintOut("Failed to load libjbc");
+	if (handle <= 0) {
+		KernelPrintOut("Failed to load libjbc\n");
 		sceSystemServiceLoadExec((char*)"exit", NULL);
+		return;
+	}
+
+	ret = sceKernelDlsym(handle, "jbc_get_cred", (void**)&jbc_get_cred);
+	KernelPrintOut("sceKernelDlsym(jbc_get_cred) returned 0x%lx\n", ret);
+
+	ret = sceKernelDlsym(handle, "jbc_jailbreak_cred", (void**)&jbc_jailbreak_cred);
+	KernelPrintOut("sceKernelDlsym(jbc_jailbreak_cred) returned 0x%lx\n", ret);
+
+	ret = sceKernelDlsym(handle, "jbc_set_cred", (void**)&jbc_set_cred);
+	KernelPrintOut("sceKernelDlsym(jbc_set_cred) returned 0x%lx\n", ret);
+
+	if (!jbc_get_cred || !jbc_jailbreak_cred || !jbc_set_cred) {
+		KernelPrintOut("libjbc is missing the expected exports\n");
+		sceSystemServiceLoadExec((char*)"exit", NULL);
+		return;
 	}
 
 	jbc_get_cred(&og);
-	jbc_jailbreak_cred(&jailbreak);
-	jbc_set_cred(&jailbreak);
+	jbc_jailbreak_cred(&jailbreak_cred);
+	jbc_set_cred(&jailbreak_cred);
+
+	s_jailbroken = true;
+}
+
+/* Hand the original credentials back rather than leaving the process unjailed
+   for whatever runs after us. */
+static void unjailbreak(void)
+{
+	if (s_jailbroken && jbc_set_cred) {
+		jbc_set_cred(&og);
+		s_jailbroken = false;
+	}
 }
 
 int main(int argc, const char* const argv[]) 
@@ -101,7 +103,7 @@ int main(int argc, const char* const argv[])
 
 	atexit(&cleanup);
 
-	Jailbreak();
+	jailbreak();
 
 	if (!load_modules()) {
 		EPRINTF("Unable to load modules.\n");
@@ -188,9 +190,7 @@ err_user_service_terminate:
 		EPRINTF("sceUserServiceTerminate failed: 0x%08X\n", ret);
 	}
 
-err:;
-
-done:
+err:
 	exit(0);
 	return 0;
 }
@@ -266,12 +266,6 @@ static bool load_modules(void) {
 
 done:
 	return true;
-
-err_unload_np_common:
-	ret = sceSysmoduleUnloadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NP_COMMON);
-	if (ret) {
-		EPRINTF("sceSysmoduleUnloadModuleInternal(%s) failed: 0x%08X\n", STRINGIFY_DEEP(ORBIS_SYSMODULE_INTERNAL_NP_COMMON), ret);
-	}
 
 err_unload_bgft:
 	ret = sceSysmoduleUnloadModuleInternal(ORBIS_SYSMODULE_INTERNAL_BGFT);
@@ -391,9 +385,10 @@ static void unload_modules(void) {
 	s_modules_loaded = false;
 }
 
-static void cleanup(void) 
+static void cleanup(void)
 {
 	unload_modules();
+	unjailbreak();
 }
 
 void catchReturnFromMain(int exit_code) {}
