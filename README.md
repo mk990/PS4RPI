@@ -47,6 +47,17 @@ without ICU. Either install ICU, or build with:
 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 make
 ```
 
+If the build instead aborts at `pkg_build` with "No usable version of libssl
+was found", the same binary is a self-contained .NET Core 3.0 build whose crypto
+layer can only load OpenSSL 1.0/1.1 — it does not understand the OpenSSL 3 that
+current distributions ship. Install your distribution's OpenSSL 1.1 compatibility
+package (`openssl-1.1` on Arch, `libssl1.1` on Debian/Ubuntu) or unpack one next
+to the build and point the loader at it:
+
+```bash
+LD_LIBRARY_PATH=/path/to/openssl-1.1/lib make
+```
+
 ### Other make targets
 
 ```bash

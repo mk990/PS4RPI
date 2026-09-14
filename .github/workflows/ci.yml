@@ -54,11 +54,39 @@ jobs:
           chmod -R +x "$root/bin" 2>/dev/null || true
           echo "OO_PS4_TOOLCHAIN=$root" >> "$GITHUB_ENV"
 
+      # PkgTool.Core is a self-contained .NET Core 3.0 binary, and that runtime
+      # only knows how to dlopen libssl.so.1.1/1.0.x. On a runner that ships
+      # OpenSSL 3 (Ubuntu 22.04 and later) pkg_build aborts with "No usable
+      # version of libssl was found". Unpack focal's libssl1.1 beside the build
+      # instead of installing an EOL OpenSSL system-wide.
+      - name: Provide OpenSSL 1.1 for PkgTool.Core
+        run: |
+          set -eu
+          pool=https://archive.ubuntu.com/ubuntu/pool/main/o/openssl
+          deb=libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb
+          if ! curl -fsSL "$pool/$deb" -o /tmp/libssl1.1.deb; then
+            # The pool keeps only the current build of each package, so fall
+            # back to whatever focal's libssl1.1 is if the pin was superseded.
+            deb=$(curl -fsSL "$pool/" \
+              | grep -oE 'libssl1\.1_1\.1\.1f-[^"]*_amd64\.deb' \
+              | sort -u | sort -t_ -k2,2V | tail -1)
+            if [ -z "$deb" ]; then
+              echo "No libssl1.1 build found in $pool" >&2
+              exit 1
+            fi
+            echo "Pin was superseded; using $deb"
+            curl -fsSL "$pool/$deb" -o /tmp/libssl1.1.deb
+          fi
+          dpkg-deb -x /tmp/libssl1.1.deb "$HOME/openssl1.1"
+          echo "OPENSSL11_LIB=$HOME/openssl1.1/usr/lib/x86_64-linux-gnu" >> "$GITHUB_ENV"
+
       - name: Build
         # PkgTool.Core is a .NET binary and aborts on a runner without ICU
-        # ("Couldn't find a valid ICU package installed on the system").
+        # ("Couldn't find a valid ICU package installed on the system"), and
+        # needs the OpenSSL 1.1 unpacked above to get through pkg_build.
         env:
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: '1'
+          LD_LIBRARY_PATH: ${{ env.OPENSSL11_LIB }}
         run: make
 
       - name: Upload package
