@@ -67,10 +67,17 @@ asset named `RPI-<tag>.pkg`:
 git tag v1.02 && git push origin v1.02
 ```
 
-Keep the tag in step with `VERSION` in the Makefile — that is what ends up in
-`param.sfo` and what the console shows for the installed app. CI warns when the
-two disagree. Every other push uploads the same package as a build artifact
-instead, downloadable from the run's page for 90 days.
+The tag is the version: a tag build passes `VERSION=<tag without the v>` to
+make, so `param.sfo` — and therefore the version the console shows for the
+installed app — always matches the release the package came from. `make tag`
+goes the other way and tags the current commit as `v$(VERSION)`:
+
+```bash
+make tag && git push origin v1.04
+```
+
+Every other push uploads the same package as a build artifact instead,
+downloadable from the run's page for 90 days.
 
 ### Other make targets
 

@@ -90,7 +90,18 @@ jobs:
         env:
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: '1'
           LD_LIBRARY_PATH: ${{ env.OPENSSL11_LIB }}
-        run: make
+        run: |
+          set -eu
+          # A tag is the version. Overriding VERSION on the make command line
+          # puts the tag into param.sfo, so the version the console shows for
+          # the installed app is always the one on the release it came from,
+          # whatever the Makefile happens to say.
+          if [ "${GITHUB_REF_TYPE:-branch}" = tag ]; then
+            echo "Building $GITHUB_REF_NAME (VERSION=${GITHUB_REF_NAME#v})"
+            make VERSION="${GITHUB_REF_NAME#v}"
+          else
+            make
+          fi
 
       # archive: false uploads the .pkg as-is instead of wrapping it in a zip,
       # so the download is the package itself. It takes a single file, which
@@ -109,11 +120,6 @@ jobs:
         run: |
           set -eu
           tag=$GITHUB_REF_NAME
-          version=$(sed -n 's/^VERSION *:= *//p' Makefile)
-          if [ "$tag" != "v$version" ]; then
-            echo "::warning::tag $tag does not match Makefile VERSION $version," \
-                 "so the installed package will report $version"
-          fi
           pkg=$(ls -1 ./*.pkg | head -1)
           asset="RPI-$tag.pkg"
           cp "$pkg" "$asset"

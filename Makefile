@@ -1,6 +1,6 @@
 # Package metadata.
 TITLE       := RPI
-VERSION     := 1.02
+VERSION     := 1.04
 TITLE_ID    := KPBR01111
 CONTENT_ID  := IV0000-KPBR01111_00-AAAAAAAAAAAAAAAA
 
@@ -104,7 +104,13 @@ compile_commands.json:
 	@printf '\n]\n' >> $@
 	@echo "wrote $@"
 
-.PHONY: all clean compile_commands
+# Tags the current commit as the release of this VERSION. CI builds a tag with
+# VERSION taken from the tag itself, so the two cannot drift apart.
+tag:
+	git tag -a v$(VERSION) -m "RPI v$(VERSION)"
+	@echo "tagged v$(VERSION) -- push it with: git push origin v$(VERSION)"
+
+.PHONY: all clean compile_commands tag
 
 compile_commands: compile_commands.json
 
