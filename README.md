@@ -58,6 +58,20 @@ to the build and point the loader at it:
 LD_LIBRARY_PATH=/path/to/openssl-1.1/lib make
 ```
 
+### Releases
+
+Pushing a `v*` tag builds the package in CI and publishes it as a GitHub release
+asset named `RPI-<tag>.pkg`:
+
+```bash
+git tag v1.02 && git push origin v1.02
+```
+
+Keep the tag in step with `VERSION` in the Makefile — that is what ends up in
+`param.sfo` and what the console shows for the installed app. CI warns when the
+two disagree. Every other push uploads the same package as a build artifact
+instead, downloadable from the run's page for 90 days.
+
 ### Other make targets
 
 ```bash

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: ['**']
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -10,7 +11,7 @@ jobs:
     name: Syntax check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
@@ -22,11 +23,13 @@ jobs:
     name: Package build
     runs-on: ubuntu-latest
     # The toolchain is fetched from a third-party release, so a change in its
-    # asset layout should report rather than block. Once this is pinned to a
-    # known-good release, drop this line to make the build gating.
-    continue-on-error: true
+    # asset layout should report rather than block on a branch push. A tag is
+    # a release, so there it has to gate instead.
+    continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install clang and lld
         run: sudo apt-get update && sudo apt-get install -y clang lld unzip
@@ -89,9 +92,32 @@ jobs:
           LD_LIBRARY_PATH: ${{ env.OPENSSL11_LIB }}
         run: make
 
+      # archive: false uploads the .pkg as-is instead of wrapping it in a zip,
+      # so the download is the package itself. It takes a single file, which
+      # is what the build produces, and names the artifact after it.
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: rpi-pkg
           path: '*.pkg'
+          archive: false
           if-no-files-found: warn
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$GITHUB_REF_NAME
+          version=$(sed -n 's/^VERSION *:= *//p' Makefile)
+          if [ "$tag" != "v$version" ]; then
+            echo "::warning::tag $tag does not match Makefile VERSION $version," \
+                 "so the installed package will report $version"
+          fi
+          pkg=$(ls -1 ./*.pkg | head -1)
+          asset="RPI-$tag.pkg"
+          cp "$pkg" "$asset"
+          # Re-running the workflow for a tag should refresh the asset rather
+          # than fail on the release that already exists.
+          gh release create "$tag" "$asset" --title "RPI $tag" --generate-notes \
+            || gh release upload "$tag" "$asset" --clobber
