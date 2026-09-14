@@ -2,6 +2,9 @@
 
 #include "common.h"
 
+#define SFO_MAGIC "\0PSF"
+#define SFO_MAGIC_SIZE 4
+
 enum sfo_value_format {
 	SFO_FORMAT_STRING_SPECIAL = 0x4,
 	SFO_FORMAT_STRING = 0x204,

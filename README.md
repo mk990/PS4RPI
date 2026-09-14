@@ -306,6 +306,26 @@ curl -s -G http://192.168.1.20:12801/api/is_exists \
   --data-urlencode 'data={"title_id":"CUSA00000"}'
 ```
 
+## Host requirements
+
+RPI reads the package header, the entry table and `param.sfo` out of the PKG
+before it registers anything, so the host serving the file must:
+
+- answer `Range` requests with `206 Partial Content` — a host that ignores the
+  header and replies `200` with the whole file is rejected, because the bytes
+  it returns come from offset 0 and are not the ones that were asked for;
+- send a `Content-Length` (no chunked-only responses);
+- serve the pieces of a split package in the order they are listed, each piece
+  reachable on its own URL.
+
+Checking a host by hand:
+
+```bash
+curl -sI -H 'Range: bytes=0-15' http://192.168.1.10/game.pkg
+# => HTTP/1.1 206 Partial Content
+# => Content-Range: bytes 0-15/4294967296
+```
+
 ## NOTES
 
 - The default port is 12801

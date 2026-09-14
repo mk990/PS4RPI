@@ -7,7 +7,6 @@
 #include "uthash.h"
 #include "utarray.h"
 #include "utlist.h"
-#define SFO_MAGIC "\0PSF"
 
 #define SIZEOF_SFO_HEADER 0x14
 

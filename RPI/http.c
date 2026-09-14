@@ -36,7 +36,8 @@ struct download_file_cb_args {
 	uint64_t content_length;
 	uint8_t* chunk;
 	size_t chunk_size;
-	bool is_partial;
+	bool want_partial;
+	bool range_ignored;
 	int status_code;
 };
 
@@ -347,6 +348,12 @@ bool http_get_file_size(const char* url, uint64_t* total_size, int ssl_verify) {
 		set_last_error("Unexpected HTTP status %d for '%s'.", args.status_code, url);
 		goto err;
 	}
+	/* No Content-Length, so nothing to report: the piece sizes written into the
+	   reference json have to be real numbers. */
+	if (args.content_length == UINT64_MAX) {
+		set_last_error("Server did not report a size for '%s'.", url);
+		goto err;
+	}
 
 	if (total_size) {
 		*total_size = args.content_length;
@@ -393,9 +400,15 @@ bool http_download_file(const char* url, uint8_t** data, uint64_t* data_size, ui
 		headers[header_count * 2 + 0] = "Range";
 		headers[header_count * 2 + 1] = range_str;
 		++header_count;
+
+		args.want_partial = true;
 	}
 
 	ret = do_request(url, ORBIS_METHOD_GET, NULL, 0, headers, header_count, &download_file_cb, &args, ssl_verify);
+	if (args.range_ignored) {
+		set_last_error("Server answered a range request for '%s' with HTTP %d instead of 206, so it cannot serve partial content.", url, args.status_code);
+		goto err_data_free;
+	}
 	if (ret) {
 		goto err_data_free;
 	}
@@ -520,6 +533,15 @@ static int download_file_cb(void* arg, int req_id, int status_code, uint64_t con
 
 	if (!is_good_status(status_code)) {
 		ret = 404;
+		goto err;
+	}
+
+	/* A server that does not implement Range answers the whole file with 200.
+	   Reading that body would hand back bytes from offset 0 while the caller
+	   believes it got the bytes it asked for, so refuse it instead. */
+	if (args->want_partial && status_code != 206) {
+		args->range_ignored = true;
+		ret = SCE_HTTP_ERROR_INVALID_VALUE;
 		goto err;
 	}
 

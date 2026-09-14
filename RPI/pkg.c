@@ -1,5 +1,6 @@
 #include "pkg.h"
 #include "http.h"
+#include "sfo.h"
 #include "util.h"
 
 #include <orbis/libkernel.h>
@@ -234,6 +235,17 @@ err:
 		EPRINTF(format, ##__VA_ARGS__); \
 	} while (0)
 
+/* Transfers fail for reasons only the transport knows about - a TLS problem, a
+   host that cannot serve ranges - so pass its own message through when it left
+   one, and fall back to the generic description otherwise. */
+#define PKG_THROW_HTTP_ERROR(format, ...) \
+	do { \
+		if (*http_get_last_error() != '\0') \
+			PKG_THROW_ERROR("%s", http_get_last_error()); \
+		else \
+			PKG_THROW_ERROR(format, ##__VA_ARGS__); \
+	} while (0)
+
 bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* ref_pkg_json_path, const char* param_sfo_path, const char* icon0_png_path, enum pkg_content_type* content_type, uint64_t* package_size, bool* is_patch, bool* has_icon, char* error_buf, size_t error_buf_size, int ssl_verify) {
 	static const uint8_t magic[] = { '\x7F', 'C', 'N', 'T' };
 	struct pkg_header* hdr;
@@ -286,13 +298,7 @@ bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* 
 
 	//printf("Downloading package header: %s\n", piece_urls[0]);
 	if (!http_download_file(piece_urls[0], &hdr_data, &hdr_size, &total_size, 0, ssl_verify)) {
-		/* This is the first transfer, so it is where a TLS problem surfaces.
-		   Pass the transport's own message through instead of a generic one. */
-		if (*http_get_last_error() != '\0') {
-			PKG_THROW_ERROR("%s", http_get_last_error());
-		} else {
-			PKG_THROW_ERROR("Unable to download package header for '%s'.\n", piece_urls[0]);
-		}
+		PKG_THROW_HTTP_ERROR("Unable to download package header for '%s'.\n", piece_urls[0]);
 		goto err;
 	}
 	//printf("Package header size: 0x%" PRIX64 "\n", hdr_size);
@@ -328,7 +334,7 @@ bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* 
 
 	//printf("Downloading package entry table: %s\n", piece_urls[0]);
 	if (!http_download_file(piece_urls[0], &entry_table_data, &entry_table_size, NULL, entry_table_offset, ssl_verify)) {
-		PKG_THROW_ERROR("Unable to download package entry table for '%s'.\n", piece_urls[0]);
+		PKG_THROW_HTTP_ERROR("Unable to download package entry table for '%s'.\n", piece_urls[0]);
 		goto err;
 	}
 	//printf("Package entry table size: 0x%" PRIX64 "\n", entry_table_size);
@@ -354,25 +360,36 @@ bool pkg_setup_prerequisites(char** piece_urls, size_t piece_count, const char* 
 next:;
 	}
 
-	if (param_sfo_offset > 0 && param_sfo_size > 0) {
-		//printf("Downloading %s: %s\n", "param.sfo", piece_urls[0]);
-		param_sfo_dl_size = param_sfo_size;
-		if (!http_download_file(piece_urls[0], &param_sfo_data, &param_sfo_dl_size, NULL, param_sfo_offset, ssl_verify)) {
-			PKG_THROW_ERROR("Unable to download %s for '%s'.\n", "param.sfo", piece_urls[0]);
-			goto err;
-		}
-		//printf("param.sfo size: 0x%" PRIX64 "\n", param_sfo_dl_size);
-		if (param_sfo_dl_size != param_sfo_size) {
-			PKG_THROW_ERROR("%s size mismatch for '%s'.\n", "param.sfo", piece_urls[0]);
-			goto err;
-		}
+	/* Without it there is no title and no content id, so the install cannot be
+	   described to the download service at all. */
+	if (param_sfo_offset == 0 || param_sfo_size == 0) {
+		PKG_THROW_ERROR("No %s entry in package '%s'.\n", "param.sfo", piece_urls[0]);
+		goto err;
+	}
+
+	//printf("Downloading %s: %s\n", "param.sfo", piece_urls[0]);
+	param_sfo_dl_size = param_sfo_size;
+	if (!http_download_file(piece_urls[0], &param_sfo_data, &param_sfo_dl_size, NULL, param_sfo_offset, ssl_verify)) {
+		PKG_THROW_HTTP_ERROR("Unable to download %s for '%s'.\n", "param.sfo", piece_urls[0]);
+		goto err;
+	}
+	//printf("param.sfo size: 0x%" PRIX64 "\n", param_sfo_dl_size);
+	if (param_sfo_dl_size != param_sfo_size) {
+		PKG_THROW_ERROR("%s size mismatch for '%s'.\n", "param.sfo", piece_urls[0]);
+		goto err;
+	}
+	/* Catch a host that served the wrong bytes here, where the package is still
+	   named, rather than letting it surface as an unexplained parse failure. */
+	if (param_sfo_size < SFO_MAGIC_SIZE || memcmp(param_sfo_data, SFO_MAGIC, SFO_MAGIC_SIZE) != 0) {
+		PKG_THROW_ERROR("Invalid %s contents for '%s'.\n", "param.sfo", piece_urls[0]);
+		goto err;
 	}
 
 	if (icon0_png_offset > 0 && icon0_png_size > 0) {
 		//printf("Downloading %s: %s\n", "icon0.png", piece_urls[0]);
 		icon0_png_dl_size = icon0_png_size;
 		if (!http_download_file(piece_urls[0], &icon0_png_data, &icon0_png_dl_size, NULL, icon0_png_offset, ssl_verify)) {
-			PKG_THROW_ERROR("Unable to download %s for '%s'.\n", "icon0.png", piece_urls[0]);
+			PKG_THROW_HTTP_ERROR("Unable to download %s for '%s'.\n", "icon0.png", piece_urls[0]);
 			goto err;
 		}
 		//printf("icon0.png size: 0x%" PRIX64 "\n", icon0_png_dl_size);
@@ -406,7 +423,7 @@ next:;
 		if (i > 0) {
 			//printf("Getting piece information: %s\n", piece_urls[i]);
 			if (!http_get_file_size(piece_urls[i], &total_size, ssl_verify)) {
-				PKG_THROW_ERROR("Unable to get file size for piece '%s'.\n", piece_urls[i]);
+				PKG_THROW_HTTP_ERROR("Unable to get file size for piece '%s'.\n", piece_urls[i]);
 				goto err_file_close;
 			}
 			//printf("Piece size: 0x%" PRIX64 "\n", total_size);
@@ -430,11 +447,9 @@ next:;
 		goto err_file_close;
 	}
 
-	if (param_sfo_offset > 0 && param_sfo_size > 0) {
-		if (!write_file_trunc(param_sfo_path, param_sfo_data, param_sfo_size, NULL, S_IRUSR | S_IWUSR)) {
-			PKG_THROW_ERROR("Unable to write %s file for '%s'.\n", "param.sfo", piece_urls[0]);
-			goto err_file_close;
-		}
+	if (!write_file_trunc(param_sfo_path, param_sfo_data, param_sfo_size, NULL, S_IRUSR | S_IWUSR)) {
+		PKG_THROW_ERROR("Unable to write %s file for '%s'.\n", "param.sfo", piece_urls[0]);
+		goto err_file_close;
 	}
 	if (icon0_png_offset > 0 && icon0_png_size > 0) {
 		if (!write_file_trunc(icon0_png_path, icon0_png_data, icon0_png_size, NULL, S_IRUSR | S_IWUSR)) {
@@ -489,6 +504,7 @@ err:
 	return status;
 }
 
+#undef PKG_THROW_HTTP_ERROR
 #undef PKG_THROW_ERROR
 
 bool pkg_is_patch(struct pkg_header* hdr) {
