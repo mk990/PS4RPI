@@ -5,9 +5,9 @@
 #include "KPutil.h"
 
 #include <orbis/libkernel.h>
-#include <orbis/userservice.h>
+#include <orbis/UserService.h>
 #include <orbis/AppInstUtil.h>
-#include <orbis/bgft.h>
+#include <orbis/Bgft.h>
 #include <sys/param.h>
 
 #define _NDBG 
@@ -33,9 +33,6 @@ static OrbisBgftInitParams s_bgft_init_params;
 
 static bool s_app_inst_util_initialized = false;
 static bool s_bgft_initialized = false;
-
-static bool modify_download_task_for_patch_internal(const char* path, int index);
-static bool modify_download_task_for_patch(OrbisBgftTaskId task_id);
 
 bool app_inst_util_init(void) {
 	int ret;
@@ -143,7 +140,6 @@ invalid_content_id:
 		goto err;
 	}
 
-done:
 	return true;
 
 err:
@@ -258,6 +254,7 @@ err:
 }
 
 bool app_inst_util_get_size(const char* title_id, unsigned long* size, int* error) {
+	uint32_t size32 = 0;
 	int ret;
 
 	if (!s_app_inst_util_initialized) {
@@ -276,7 +273,7 @@ bool app_inst_util_get_size(const char* title_id, unsigned long* size, int* erro
 		goto err;
 	}
 
-	ret = sceAppInstUtilAppGetSize(title_id, size);
+	ret = sceAppInstUtilAppGetSize(title_id, &size32);
 	if (ret) {
 		if (error) {
 			*error = ret;
@@ -284,6 +281,10 @@ bool app_inst_util_get_size(const char* title_id, unsigned long* size, int* erro
 		EPRINTF("sceAppInstUtilAppGetSize failed: 0x%08X\n", ret);
 		goto err;
 	}
+
+	/* The SDK only writes 32 bits; widen rather than hand it an unsigned long
+	   and leave the upper half of the caller's variable undefined. */
+	*size = size32;
 
 	return true;
 

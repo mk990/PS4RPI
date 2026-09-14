@@ -1,8 +1,11 @@
 #pragma once
 
-#include <orbis/_types/http.h>
-
+/* common.h first: the SDK header below typedefs OrbisHttpsCallback in terms of
+   int32_t, and does not pull in stdint.h itself. Including it first leaves
+   int32_t undefined there, which cascades into a wall of unrelated errors. */
 #include "common.h"
+
+#include <orbis/_types/http.h>
 
 // Empty Comment
 int sceHttpAbortRequest(int reqId);

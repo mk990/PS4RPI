@@ -450,7 +450,6 @@ static void sb_stream_destroy(sb_Stream *st) {
 static int sb_stream_recv(sb_Stream *st) {
   for (;;) {
     char buf[4096];
-    size_t n;
     int err, i, sz;
 
     /* Receive data */
@@ -889,7 +888,7 @@ sb_Server *sb_new_server(const sb_Options *opt) {
   err = sceNetSetsockopt(srv->sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
   
   /* Bind and listen */
-  err = sceNetBind(srv->sockfd, (struct sockaddr*)&in_addr, sizeof(in_addr));
+  err = sceNetBind(srv->sockfd, (const OrbisNetSockaddr*)&in_addr, sizeof(in_addr));
   if (err)
   {
 	  KernelPrintOut("Failed to bind socket ret %d %s\n", err, strerror(errno));
