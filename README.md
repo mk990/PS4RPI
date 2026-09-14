@@ -39,6 +39,14 @@ brew install llvm
 sudo OO_PS4_TOOLCHAIN=/opt/OpenOrbis-PS4-Toolchain make
 ```
 
+If `PkgTool.Core` aborts with "Couldn't find a valid ICU package installed on
+the system", it is the toolchain's .NET binary refusing to start on a machine
+without ICU. Either install ICU, or build with:
+
+```bash
+DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 make
+```
+
 ### Other make targets
 
 ```bash

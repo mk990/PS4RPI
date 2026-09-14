@@ -55,6 +55,10 @@ jobs:
           echo "OO_PS4_TOOLCHAIN=$root" >> "$GITHUB_ENV"
 
       - name: Build
+        # PkgTool.Core is a .NET binary and aborts on a runner without ICU
+        # ("Couldn't find a valid ICU package installed on the system").
+        env:
+          DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: '1'
         run: make
 
       - name: Upload package
