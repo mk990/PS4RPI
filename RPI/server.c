@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <orbis/libkernel.h>
 #include <fcntl.h>
@@ -15,6 +16,9 @@
 #include "tiny-json.h"
 
 #define CLEANUP_DAY_COUNT 3
+
+/* How long the accept loop waits between polls when no client is connecting. */
+#define SERVER_POLL_INTERVAL_US (10 * 1000)
 
 /* Enough for the largest request any endpoint accepts. */
 #define JSON_POOL_SIZE 256
@@ -194,6 +198,13 @@ bool server_listen(void) {
 
 	while (s_server_started) {
 		sb_poll_server(s_server);
+
+		/* The listening socket is non-blocking, so sb_poll_server returns the
+		   moment nothing is waiting to be accepted. Without a pause here the
+		   loop pegs a core for the lifetime of the app and starves the
+		   background download it exists to supervise. The delay is only ever
+		   paid on an idle server, and is imperceptible on a LAN API. */
+		sceKernelUsleep(SERVER_POLL_INTERVAL_US);
 	}
 
 	return true;
@@ -1099,6 +1110,8 @@ static void cleanup_temp_files(void) {
 	OrbisKernelStat stat_buf;
 	struct timespec now;
 	time_t atime;
+	size_t reclen;
+	int dent_size;
 	int fd = -1;
 	int ret;
 
@@ -1115,7 +1128,7 @@ static void cleanup_temp_files(void) {
 	for (;;) {
 		memset(buf, 0, sizeof(buf));
 
-		ret = sceKernelGetdents(fd, buf, sizeof(buf));
+		dent_size = ret = sceKernelGetdents(fd, buf, sizeof(buf));
 		if (ret < 0) {
 			EPRINTF("sceKernelGetdents failed: 0x%08X\n", ret);
 			goto err;
@@ -1125,11 +1138,22 @@ static void cleanup_temp_files(void) {
 		}
 		entry = (struct dirent*)buf;
 
-		// #define DT_UNKNOWN 0
-		while (entry->d_fileno != 0)
-		{
+		/* Walk the bytes the kernel reported. The zeroed buffer used to act as
+		   the terminator, but a directory whose last entry ends flush with the
+		   end of the buffer leaves no zeroed d_fileno to stop on, and the walk
+		   then reads past it. */
+		while ((char*)entry + offsetof(struct dirent, d_name) <= buf + dent_size) {
+			reclen = entry->d_reclen;
+
+			/* A record that does not fit, or cannot advance the cursor, means
+			   the buffer is not what we think it is; stop rather than spin. */
+			if (reclen < offsetof(struct dirent, d_name) || (char*)entry + reclen > buf + dent_size) {
+				break;
+			}
+
+			// #define DT_UNKNOWN 0
 			// #define DT_REG 8
-			if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 && entry->d_type == 8) {
+			if (entry->d_fileno != 0 && strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 && entry->d_type == 8) {
 				snprintf(full_path, sizeof(full_path), "%s/%s", s_work_dir, entry->d_name);
 
 				if (starts_with(entry->d_name, "tmp_") && (ends_with(entry->d_name, ".json") || ends_with(entry->d_name, ".sfo") || ends_with(entry->d_name, ".png"))) {
@@ -1148,12 +1172,12 @@ static void cleanup_temp_files(void) {
 				}
 			}
 
-			entry = (struct dirent*)((char*)entry + entry->d_reclen);
+			entry = (struct dirent*)((char*)entry + reclen);
 		}
 	}
 
 err:
-	if (fd > 0) {
+	if (fd >= 0) {
 		ret = sceKernelClose(fd);
 		if (ret) {
 			EPRINTF("sceKernelClose failed: 0x%08X\n", ret);

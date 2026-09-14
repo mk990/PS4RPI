@@ -12,6 +12,7 @@ int sceKernelOpen(const char* path, int flags, int mode);
 int sceKernelClose(int fd);
 int sceKernelStat(const char* path, OrbisKernelStat* st);
 int sceKernelGetdents(int fd, char* buf, size_t size);
+int32_t sceKernelUsleep(uint32_t usec);
 int sceKernelSendNotificationRequest(int a, OrbisNotificationRequest* r, size_t n, int b);
 int sceKernelDebugOutText(int a, const char* s);
 uint32_t sceKernelLoadStartModule(const char*, size_t, const void*, uint32_t, void*, void*);
